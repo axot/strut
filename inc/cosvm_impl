@@ -1,0 +1,1133 @@
+// -*-c++-*-
+/// \file cosvm_impl
+/// \brief Templated implementation of CCOSVM
+/// \author Artem Sokolov
+
+#ifndef COSVM_IMPL__INCLUDED
+#define COSVM_IMPL__INCLUDED
+
+#include "opt.h"
+#include <boost/thread.hpp>
+#include <functional>
+
+#include <boost/spirit/include/classic.hpp>
+#include <boost/spirit/include/classic_file_iterator.hpp>
+#include <boost/spirit/include/classic_increment_actor.hpp>
+#include <boost/spirit/include/classic_clear_actor.hpp>
+namespace spirit = boost::spirit::classic;
+
+template< typename _I1, typename _I2, typename _O >
+template< typename _V >
+void CCOSVM<_I1,_I2,_O>::CViewTrainer<_V>::operator() ()
+{
+  cout<<hdr<<": running optimization"<<endl;
+  while( true )
+    {
+      // Traverse the samples
+      nAdded = 0;
+      for( unsigned int xk = range.first; xk < range.second; xk++ )
+	if( pSVM->optLab( v, xk ) ) nAdded++;
+
+      if( bSinglePass == true ) break;
+
+      cout<<hdr<<": "<<nAdded<<" new constraints added"<<endl;
+      if( nAdded == 0 ) break;
+    }
+  cout<<hdr<<": finished"<<endl;
+}
+
+template< typename _I1, typename _I2, typename _O >
+void CCOSVM<_I1,_I2,_O>::CTester::operator() ()
+{
+  for( unsigned int i = range.first; i < range.second; i++ )
+    {
+      // Compose the input-space samples
+      std::pair< const CDataSet<_I1>&, unsigned int > s1( *pTest1.getI(), i );
+      std::pair< const CDataSet<_I2>&, unsigned int > s2( *pTest2.getI(), i );
+
+      // Perform inference
+      pred[i] = pSVM->infer( s1, s2 );
+    }
+}
+
+template< typename _I1, typename _I2, typename _O >
+template< typename _V >
+void CCOSVM<_I1,_I2,_O>::CFComputer<_V>::operator() ()
+{
+  for( unsigned int i = range.first; i < range.second; i++ )
+    res[i] = pSVM->f_view( v, xk, i );
+}
+
+///////////////////////////////////////////////////////////////////////////////////////////////
+
+// Adds a new constraint to a particular view; throws if constraint exists
+template< typename _I1, typename _I2, typename _O >
+void CCOSVM<_I1,_I2,_O>::addConstraint_impl( vector< svec_t >& alpha, unsigned int xk, unsigned int ybar )
+{
+  if( alpha[xk].find( ybar ) == alpha[xk].end() )
+    alpha[xk][ybar] = 0.0;
+  else throw std::logic_error( "Constraint is already part of the working set" );
+}
+
+// Updates the sum of alphas for a particular sample in a particular view
+template< typename _I1, typename _I2, typename _O >
+void CCOSVM<_I1,_I2,_O>::updateSum_impl( const vector< svec_t >& alpha, vector< double >& asum, unsigned int xk )
+{
+  asum[xk] = 0.0;
+  for( svec_t::const_iterator iter = alpha[xk].begin(); iter != alpha[xk].end(); iter++ )
+    asum[xk] += iter->second;
+}
+
+// Returns the true / assigned label for a sample in a particular view
+template< typename _I1, typename _I2, typename _O >
+template< typename _I >
+unsigned int CCOSVM<_I1,_I2,_O>::map_impl( const CIODataSet<_I, _O>& ds,
+					   const uumap_t& yassign, unsigned int xk ) const
+{
+  // Fetch a label from the dataset mapping
+  unsigned int yk = ds.map( xk );
+  
+  // Handle the unlabeled samples
+  if( yk == std::numeric_limits<unsigned int>::max() )
+    {
+      uumap_t::const_iterator iter = yassign.find( xk );
+      if( iter != yassign.end() ) return iter->second;
+    }
+
+  return yk;
+}
+
+// Compatibility function value
+template< typename _I1, typename _I2, typename _O >
+template< typename _V, typename _I, typename _T >
+double CCOSVM<_I1,_I2,_O>::f_view_impl( _V v, const CIODataSet<_I,_O>& ds,
+					const vector< svec_t >& alpha,
+					_T x, unsigned int y ) const
+{
+  double res = 0.0;
+
+  // Traverse the training samples
+  for( unsigned int xk = 0; xk < ds.sizeI(); xk++ )
+    {
+      // Skip non-SVs
+      if( alpha[xk].size() == 0 ) continue;
+
+      // Retrieve the sample associated with this specific entry
+      unsigned int yk = map( v, xk );
+
+      // Skip unlabeled examples
+      if( yk == std::numeric_limits<unsigned int>::max() ) continue;
+
+      // Precompute the input space kernel value
+      double xker = ds.ikernel( xk, x );
+
+      // Compute the first kernel value
+      double yker1 = ds.okernel( yk, y );
+      double K1 = ds.iokernel( xker, yker1 );
+
+      // Add the positive contribution
+      res += K1 * getSum( v, xk );
+
+      // Traverse the sparse vector
+      for( svec_t::const_iterator iter = alpha[xk].begin(); iter != alpha[xk].end(); iter++ )
+	{
+	  // Skip non-SVs
+	  if( iter->second == 0 ) continue;
+
+	  // Retrieve the associated ybar
+	  unsigned int ybar = iter->first;
+
+	  // Compute the second kernel value and add the contribution
+	  double yker2 = ds.okernel( ybar, y );
+	  double K2 = ds.iokernel( xker, yker2 );
+
+	  // Add the negative contribution
+	  res -= iter->second * K2;
+	}
+    }
+
+  return res;
+  
+}
+
+// Computes J_{i,y,j,ybar} in a particular view
+template< typename _I1, typename _I2, typename _O >
+template< typename _V, typename _I >
+double CCOSVM<_I1,_I2,_O>::J_impl( _V v, const CIODataSet<_I, _O>& ds,
+				   unsigned int xi, unsigned int y,
+				   unsigned int xj, unsigned int ybar ) const
+{
+  // Determine the mapping
+  unsigned int yi = map( v, xi );
+  unsigned int yj = map( v, xj );
+
+  // Compute the kernel values
+  double K1 = ds.iokernel( xi, yi, xj, yj );
+  double K2 = ds.iokernel( xi, y, xj, yj );
+  double K3 = ds.iokernel( xi, yi, xj, ybar );
+  double K4 = ds.iokernel( xi, y, xj, ybar );
+
+  return (K1 - K2 - K3 + K4);
+}
+
+// Finds the most violated constraint
+template< typename _I1, typename _I2, typename _O >
+template< typename _V, typename _I >
+int CCOSVM<_I1,_I2,_O>::mostViolConstraint_impl
+( _V v, const CIODataSet<_I, _O>& ds,
+  const vector< svec_t >& alpha, unsigned int xk ) const
+{
+  unsigned int yk = map( v, xk );
+  unsigned int no = ds.getO()->size();
+
+  // Split the output space into ranges
+  unsigned int q2 = no / 2;
+  unsigned int q1 = q2 / 2;
+  unsigned int q3 = (q2 + no) / 2;
+  std::pair< unsigned int, unsigned int > range1( 0, q1 );
+  std::pair< unsigned int, unsigned int > range2( q1, q2 );
+  std::pair< unsigned int, unsigned int > range3( q2, q3 );
+  std::pair< unsigned int, unsigned int > range4( q3, no );
+
+  // Run a separate thread on each range
+  vector<double> fvals( no );
+  CFComputer<_V> fc1( v, this, xk, range1, fvals );
+  CFComputer<_V> fc2( v, this, xk, range2, fvals );
+  CFComputer<_V> fc3( v, this, xk, range3, fvals );
+  CFComputer<_V> fc4( v, this, xk, range4, fvals );
+  boost::thread t1(fc1);
+  boost::thread t2(fc2);
+  boost::thread t3(fc3);
+  boost::thread t4(fc4);
+
+  // Wait for the threads to finish
+  t1.join(); t2.join(); t3.join(); t4.join();
+
+  // Find the largest violation and the current slack
+  unsigned int viol_argmax = 0;
+  double viol_max = -1.0 * std::numeric_limits<double>::infinity();
+  double slack_max = -1.0 * std::numeric_limits<double>::infinity();
+  double self_f = -1.0 * std::numeric_limits<double>::infinity();
+
+  // Loop over all possible labels
+  for( unsigned int yj = 0; yj < ds.getO()->size(); yj++ )
+    {
+      // Compute the loss + w^T * \psi(xk, yj) term
+      double loss = ds.oloss( yk, yj );
+      //      double dotp = f_view( v, xk, yj );
+      double dotp = fvals[yj];
+      double sum = loss + dotp;
+
+      if( sum > viol_max )
+	{
+	  viol_max = sum;
+	  viol_argmax = yj;
+	}
+
+      // Determine if we're dealing with yk right now
+      if( yj == yk ) self_f = dotp;
+
+      // Determine if yj is part of the working set
+      if( alpha[xk].find( yj ) == alpha[xk].end() ) continue;
+
+      // Update the slack if it is
+      if( sum > slack_max ) slack_max = sum;
+    }
+
+  // Adjust the slack and the violation
+  viol_max -= self_f;
+  slack_max -= self_f;
+  if( slack_max < 0 ) slack_max = 0;
+
+  // Compare and return
+  if( viol_max > (slack_max + params.eps) ) return viol_argmax;
+  else return -1;
+}
+
+// Subspace ascent
+template< typename _I1, typename _I2, typename _O >
+template< typename _V, typename _I >
+void CCOSVM<_I1,_I2,_O>::SVMopt_impl( _V v, const CIODataSet<_I, _O>&  ds,
+				      vector< svec_t >& alpha, unsigned int xk, double Cn )
+{
+  // Do nothing if there are no coefficients
+  if( alpha[xk].size() == 0 ) return;
+  const unsigned int n = alpha[xk].size();
+
+  // Find the associated mapping into the output space
+  unsigned int yk = map( v, xk );
+  if( yk == std::numeric_limits<unsigned int>::max() )
+    throw std::logic_error( "Invalid label" );
+
+  // Compute the J matrix entries
+  vector< double > Jmat( n*n );
+  unsigned int Jmat_i = 0;
+  for( svec_t::const_iterator iter_i = alpha[xk].begin(); iter_i != alpha[xk].end(); iter_i++ )
+    for( svec_t::const_iterator iter_j = alpha[xk].begin(); iter_j != alpha[xk].end(); iter_j++ )
+      Jmat[Jmat_i++] = J( v, xk, iter_i->first, xk, iter_j->first );
+
+  // Compute the constant factor
+  vector< double > delta( n );
+  unsigned int delta_i = 0;
+  for( svec_t::const_iterator iter_i = alpha[xk].begin(); iter_i != alpha[xk].end(); iter_i++ )
+    {
+      delta[delta_i] = ds.oloss( yk, iter_i->first );
+      for( unsigned int kk = 0; kk < alpha.size(); kk++ )
+	{
+	  if( kk == xk ) continue;
+	  for( svec_t::const_iterator iter_j = alpha[kk].begin(); iter_j != alpha[kk].end(); iter_j++ )
+	    delta[delta_i] -= iter_j->second * J( v, xk, iter_i->first, kk, iter_j->first );
+	}
+      delta_i++;
+    }
+
+  // Maximize -0.5 * x^T J x + delta^T x subject to \sum x <= Cn
+  vector<double> x = strongQuadraticOpt( Jmat, delta, Cn );
+
+  // Store the solution
+  unsigned int x_i = 0;
+  for( svec_t::iterator iter_i = alpha[xk].begin(); iter_i != alpha[xk].end(); iter_i++ )
+    iter_i->second = x[x_i++];
+
+  // Update the alpha sum
+  updateSum( v, xk );
+}
+
+// Labeled optimization
+template< typename _I1, typename _I2, typename _O >
+template< typename _V >
+bool CCOSVM<_I1,_I2,_O>::optLab_impl( _V v, vector< svec_t >& alpha, unsigned int xk )
+{
+  // Find the most violated constraint
+  int yviol = mostViolConstraint( v, xk );
+  if( yviol < 0 ) return false;
+
+  // Add constraint to the working set
+  addConstraint( v, xk, yviol );
+  
+  // Perform subspace ascent
+  SVMopt( v, xk, params.Cn_l );
+
+  return true;
+}
+
+// Infers the top two labels for a particular sample in a particular view
+template< typename _I1, typename _I2, typename _O >
+template< typename _V, typename _I, typename _T >
+unsigned int CCOSVM<_I1, _I2, _O>::infer_impl( _V v, shared_ptr< const CIODataSet<_I, _O> > pds,
+					       const vector< svec_t >& alpha, _T x ) const
+{
+  // Compute the score on the first sample
+  unsigned int f_argmax = 0;
+  double f_max = f_view( v, x, 0 );
+
+  // Traverse the remainder of the samples
+  for( unsigned int yi = 1; yi < pds->getO()->size(); yi++ )
+    {
+      double val = f_view( v, x, yi );
+      
+      // Compare to the best
+      if( val > f_max )
+	{
+	  f_max = val;
+	  f_argmax = yi;
+	}
+    }
+
+  return f_argmax;
+}
+
+template< typename _I1, typename _I2, typename _O >
+template< typename _V, typename _I >
+bool CCOSVM<_I1, _I2, _O>::unlabViol_impl( _V v, shared_ptr< const CIODataSet<_I, _O> > pds,
+					   vector<svec_t>& alpha, unsigned int xk )
+{
+  unsigned int yk = map( v, xk );
+  unsigned int no = pds->getO()->size();
+
+  // Split the output space into ranges
+  unsigned int q2 = no / 2;
+  unsigned int q1 = q2 / 2;
+  unsigned int q3 = (q2 + no) / 2;
+  std::pair< unsigned int, unsigned int > range1( 0, q1 );
+  std::pair< unsigned int, unsigned int > range2( q1, q2 );
+  std::pair< unsigned int, unsigned int > range3( q2, q3 );
+  std::pair< unsigned int, unsigned int > range4( q3, no );
+
+  // Run a separate thread on each range
+  vector<double> fvals( no );
+  CFComputer<_V> fc1( v, this, xk, range1, fvals );
+  CFComputer<_V> fc2( v, this, xk, range2, fvals );
+  CFComputer<_V> fc3( v, this, xk, range3, fvals );
+  CFComputer<_V> fc4( v, this, xk, range4, fvals );
+  boost::thread t1(fc1);
+  boost::thread t2(fc2);
+  boost::thread t3(fc3);
+  boost::thread t4(fc4);
+
+  // Wait for the threads to finish
+  t1.join(); t2.join(); t3.join(); t4.join();
+
+  // Compute the largest violation with respect to all labels
+  double xi_max = -1.0 * std::numeric_limits<double>::infinity();
+  double y_max = -1.0 * std::numeric_limits<double>::infinity();
+  double f_self = -1.0 * std::numeric_limits<double>::infinity();
+  unsigned int y_amax = 0;
+  for( unsigned int yi = 0; yi < pds->getO()->size(); yi++ )
+    {
+      // Compute the del( yk, ybar ) + f( xk, ybar ) terms
+      double loss = pds->oloss( yk, yi );
+//      double dotp = f_view( v, xk, yi );
+      double dotp = fvals[yi];
+      double val = loss + dotp;
+      
+      // Compare to the best seen so far
+      if( val > y_max )	{ y_max = val; y_amax = yi; }
+
+      // Check if we're dealing with yk
+      if( yi == yk ) f_self = dotp;
+
+      // Check to see if the label is in the working set
+      if( alpha[xk].find( yi ) == alpha[xk].end() ) continue;
+
+      // If it is, compare to the best seen so far
+      if( val > xi_max ) xi_max = val;
+    }
+
+  // Adjust both quantities by the f(xk, yk) factor
+  y_max -= f_self;
+  xi_max -= f_self;
+  if( xi_max < 0.0 ) xi_max = 0.0;
+
+  // Verify whether the new violation is bigger
+  if( y_max < xi_max + params.eps ) return false;
+
+  // Add the new constraint to the working set
+  addConstraint( v, xk, y_amax );
+  return true;
+}
+
+template< typename _I1, typename _I2, typename _O >
+template< typename _V, typename _I >
+double CCOSVM<_I1,_I2,_O>::gradient_impl( _V v, shared_ptr< const CIODataSet<_I,_O> > pds,
+					  const vector< svec_t >& alpha, unsigned int xk, unsigned int ybar ) const
+{
+  // Compute the del( yk, ybar ) term
+  unsigned int yk = map( v, xk );
+  double val = pds->oloss( yk, ybar );
+
+  // Compute the J * alpha term
+  for( unsigned int kk = 0; kk < alpha.size(); kk++ )
+    for( svec_t::const_iterator iter = alpha[kk].begin(); iter != alpha[kk].end(); iter++ )
+      val -= iter->second * J( v, xk, ybar, kk, iter->first );
+
+  return val;
+}
+
+
+/////////////////////////////////////////////////////////////////////////////////////////////////
+
+// Unlabeled optimization
+template< typename _I1, typename _I2, typename _O >
+bool CCOSVM<_I1,_I2,_O>::optUnlab( unsigned int xk )
+{
+  // Indicates whether any new constraints have been added
+  //  bool res = false;
+
+  // Clear constraint sets
+  alpha1[xk].clear(); asum1[xk] = 0.0;
+  alpha2[xk].clear(); asum2[xk] = 0.0;
+
+  // Compute the predictions for each view
+  unsigned int y1 = infer( _v1, xk );
+  unsigned int y2 = infer( _v2, xk );
+
+  for( unsigned int r = 0; r < params.rmax; r++ )
+    {
+      // Handle disagreement
+      if( y1 != y2 )
+	{
+	  if( r % 2 == 0 )
+	    {
+	      // Check to see if there's nothing new to learn
+	      if( yassign1.find(xk) != yassign1.end() && yassign1[xk] == y2 && alpha1[xk].find( y1 ) != alpha1[xk].end() )
+		break;
+
+	      // Cross-assign the "true" label, and perform constrained optimization
+	      yassign1[xk] = y2;
+	      if( alpha1[xk].find( y1 ) == alpha1[xk].end() )
+		{ addConstraint( _v1, xk, y1 ); /*res = true;*/ }
+	      SVMopt( _v1, xk, params.Cn_u );
+
+	      // Recompute the inference
+	      y1 = infer( _v1, xk );
+	    }
+	  else
+	    {
+	      // Check to see if there's nothing new to learn
+	      if( yassign2.find(xk) != yassign2.end() && yassign2[xk] == y1 && alpha2[xk].find( y2 ) != alpha2[xk].end() )
+		break;
+
+	      // Cross-assign the "true" label, and perform constrained optimization
+	      yassign2[xk] = y1;
+	      if( alpha2[xk].find( y2 ) == alpha2[xk].end() )
+		{ addConstraint( _v2, xk, y2 ); /*res = true;*/ }
+	      SVMopt( _v2, xk, params.Cn_u );
+
+	      // Recompute the inference
+	      y2 = infer( _v2, xk );
+	    }
+	}
+      else break;
+    }
+
+  // In case of consensus handle margin violations
+  if( y1 == y2 )
+    {
+      // Ensure assignment
+      yassign1[xk] = y1;
+      yassign2[xk] = y2;
+
+      // Add at most rmax constraints
+      for( unsigned int r = 0; r < params.rmax; r++ )
+	{
+	  bool b1 = unlabViol( _v1, xk );
+	  bool b2 = unlabViol( _v2, xk );
+	  if( b1 == false && b2 == false ) break;
+	}
+    }
+
+  return false;
+}
+
+// Transductive optmization
+template< typename _I1, typename _I2, typename _O >
+bool CCOSVM<_I1,_I2,_O>::optUnlabTrans( unsigned int xk )
+{
+  // Indicates whether any new constraints have been added
+  bool res = false;
+
+  // Find the label with the highest joint compatibility function value
+  unsigned int ymax = infer( xk, xk );
+
+  yassign1[xk] = ymax;
+  yassign2[xk] = ymax;
+
+  // Handle first assignment
+  if( yassign1.find( xk ) == yassign1.end() ||
+      yassign2.find( xk ) == yassign2.end() )
+    {
+      //      cout<<"First assignment for example "<<xk<<endl;
+      // Perform the assignment
+      yassign1[xk] = ymax;
+      yassign2[xk] = ymax;
+    }
+  
+  // Use it as "true" assignment
+  if( yassign1[xk] != ymax || yassign2[xk] != ymax )
+    {
+      // Perform the assignment
+      yassign1[xk] = ymax;
+      yassign2[xk] = ymax;
+
+      // Clear the associated constrains
+      cout<<"Clearing constraints for example "<<xk<<endl;
+      alpha1[xk].clear(); asum1[xk] = 0.0;
+      alpha2[xk].clear(); asum2[xk] = 0.0;
+    }
+
+  // Check for margin violations
+  if( unlabViol( _v1, xk ) ) {SVMopt( _v1, xk, params.Cn_u ); res = true;}
+  if( unlabViol( _v2, xk ) ) {SVMopt( _v2, xk, params.Cn_u ); res = true;}
+
+  return res;
+}
+
+// Training
+template< typename _I1, typename _I2, typename _O >
+void CCOSVM<_I1,_I2,_O>::train( shared_ptr< const CIODataSet<_I1, _O> > pTrain1,
+				shared_ptr< const CIODataSet<_I2, _O> > pTrain2 )
+{
+  // Verify that the two datasets are using the same output space
+  if( pTrain1->getO() != pTrain2->getO() )
+    throw std::logic_error( "The training data from the two views must share the output space" );
+
+  const unsigned int n1 = pTrain1->sizeI();
+  const unsigned int n2 = pTrain2->sizeI();
+
+  // Count the number of unlabeled examples
+  unsigned int nu = 0;
+  for( unsigned int i = 0; i < n1; i++ )
+    {
+      if( pTrain1->map( i ) == std::numeric_limits<unsigned int>::max() )
+	{
+	  // Verify consistency
+	  if( i < pTrain2->sizeI() && pTrain2->map( i ) != std::numeric_limits<unsigned int>::max() )
+	    throw std::logic_error( "Inconsistent unlabeled data" );
+	  nu++;
+	}
+      else break;
+    }
+
+  // Ensure that all other samples are labeled
+  for( unsigned int i = nu; i < n1; i++ )
+    if( pTrain1->map( i ) == std::numeric_limits<unsigned int>::max() )
+      throw std::logic_error( "View 1: Unlabeled data must appear at the beginning only" );
+
+  for( unsigned int i = nu; i < n2; i++ )
+    if( pTrain2->map( i ) == std::numeric_limits<unsigned int>::max() )
+      throw std::logic_error( "View 2: Unlabeled data must appear at the beginning only" );
+
+  // Verify that the mappings of the same labeled examples are consistent
+  for( unsigned int i = 0; i < n1; i++ )
+    {
+      string s = pTrain1->i2s( i );
+      int j = pTrain2->s2i( s );
+      if( j < 0 ) continue;
+      if( pTrain1->map( i ) != pTrain2->map( j ) )
+	throw std::logic_error( "Inconsistent training sets" );
+    }
+
+  // Determine the unlabeled optimizer to use
+  std::function<bool(CCOSVM<_I1,_I2,_O>&, unsigned int)> fUnlab;
+  if( params.bTrans == true )
+    {
+      cout<<"Running transductive SVM"<<endl;
+      fUnlab = &CCOSVM<_I1,_I2,_O>::optUnlabTrans;
+    }
+  else
+    {
+      cout<<"Running co-training"<<endl;
+      fUnlab = &CCOSVM<_I1,_I2,_O>::optUnlab;
+    }
+
+  // Save the references to local storage
+  pds1 = pTrain1;
+  pds2 = pTrain2;
+
+  // Clear and resize the weight vectors
+  alpha1.clear(); alpha1.resize( n1 );
+  alpha2.clear(); alpha2.resize( n2 );
+  asum1.clear(); asum1.resize( n1 );
+  asum2.clear(); asum2.resize( n2 );
+
+  cout<<"Training COSVM using Cn_l = "<<params.Cn_l<<" and Cn_u = "<<params.Cn_u<<endl;
+  cout<<"Working with "<<n1<<" samples in view 1 and "<<n2<<" samples in view 2"<<endl;
+  cout<<"Of these "<<nu<<" samples are unlabeled"<<endl;
+  cout<<"Prefix for saving temporary results: "<<params.fnPrefix<<endl;
+
+  // Attempt to preload any results
+  int curIter = -1;
+  if( params.fnPrefix.empty() == false )
+    {
+      curIter = preload();
+      cout<<"Preloaded iteration "<<curIter<<endl;
+    }
+
+  unsigned int nAdded1 = 0;
+  unsigned int nAdded2 = 0;
+
+  // Make a pass through the labeled data
+  if( curIter < 0 )
+    {
+      cout<<"Making a pass through labeled data"<<endl;
+
+      // View 1
+      CViewTrainer< _V1 > vt1( _v1, string("View 1"), true, this,
+			       std::pair< unsigned int, unsigned int >( nu, n1 ),
+			       nAdded1 );
+      boost::thread t1( vt1 );
+
+      // View 2
+      CViewTrainer< _V2 > vt2( _v2, string("View 2"), true, this,
+			       std::pair< unsigned int, unsigned int >( nu, n2 ),
+			       nAdded2 );
+      boost::thread t2( vt2 );
+
+      // Wait until the threads finish
+      t1.join();
+      t2.join();
+
+      cout<<"View1: "<<nAdded1<<" total constraints added"<<endl;
+      cout<<"View2: "<<nAdded2<<" total constraints added"<<endl;
+
+      // Save the labeled-only result
+      if( params.fnPrefix.empty() == false )
+      	this->save( params.fnPrefix + "_iter0.gz" );
+      curIter = 0;
+    }
+
+  // Stop when no new constraints are added
+  unsigned int nNew = 0;
+  const int max_iter = 40;
+  while( true )
+    {
+      nNew = 0;
+
+      // Make a pass through unlabeled data
+      cout<<"Unlabeled"; cout.flush();
+      for( unsigned int xk = 0; xk < nu; xk++ )
+	{
+	  if( xk % 100 == 0 ) {cout<<"."; cout.flush();}
+	  if( fUnlab( *this, xk ) ) nNew++;
+	}
+      cout<<endl;
+
+      // Make a pass through the labeled data
+      CViewTrainer< _V1 > vt1( _v1, string("View 1"), true, this,
+			       std::pair< unsigned int, unsigned int >( nu, n1 ),
+			       nAdded1 );
+      boost::thread t1( vt1 );
+
+      CViewTrainer< _V2 > vt2( _v2, string("View 2"), true, this,
+			       std::pair< unsigned int, unsigned int >( nu, n2 ),
+			       nAdded2 );
+      boost::thread t2( vt2 );
+
+      t1.join(); t2.join();
+      nNew += nAdded1;
+      nNew += nAdded2;
+
+      cout<<nNew<<" new constraints added"<<endl;
+      if( nNew == 0 ) break;
+      if( curIter > max_iter ) break;
+
+      curIter++;
+      if( params.fnPrefix.size() > 0 )
+	{
+	  string fname = params.fnPrefix + "_iter" + boost::lexical_cast<string>( curIter ) + ".gz";
+	  this->save( fname );
+	}
+    }
+}
+
+// Testing
+template< typename _I1, typename _I2, typename _O >
+vector<double> CCOSVM<_I1,_I2,_O>::test( shared_ptr< const CIODataSet<_I1, _O> > pTest1,
+					 shared_ptr< const CIODataSet<_I2, _O> > pTest2,
+					 const string& true_fname,
+					 const string& pred_fname ) const
+{
+  // Open the appropriate filenames
+  std::ofstream ofs_true;
+  std::ofstream ofs_pred;
+  if( true_fname.length() > 0 && pred_fname.length() > 0 )
+    {
+      ofs_true.open( true_fname.c_str() );
+      ofs_pred.open( pred_fname.c_str() );
+    }
+
+  // Verify that the two datasets are using the same output space as the training data
+  if( pTest1->getO() != pds1->getO() || pTest2->getO() != pds2->getO() )
+    throw std::logic_error( "The output space for the test data must match that for training data" );
+
+  shared_ptr< const CDataSet<_O> > pO = pTest1->getO();
+  const unsigned int n = pTest1->sizeI();
+
+  // Verify that the input spaces are consistent
+  if( pTest2->sizeI() != n )
+    throw std::logic_error( "Inconsistent test sets" );
+
+  for( unsigned int i = 0; i < n; i++ )
+    if( pTest1->i2s( i ) != pTest2->i2s( i ) )
+      throw std::logic_error( "Inconsistent test sets" );
+
+  const unsigned int nThreads = 8;
+  vector<unsigned int> pred( n );
+
+  // Split the range into nThreads intervals
+  unsigned int nWhole = n / nThreads;
+  unsigned int nRemain = n - nThreads * nWhole;
+
+  // Create the threads
+  cout<<"Spawning the threads"<<endl;
+  vector< shared_ptr< boost::thread> > threads;
+  unsigned int nBeg = 0;
+  for( unsigned int i = 0; i < nThreads; i++ )
+    {
+      // Compute the range
+      unsigned int nEnd = nBeg + nWhole;
+      if( i < nRemain ) nEnd++;
+      cout<<"Thread "<<i<<" will operate in ["<<nBeg<<", "<<nEnd<<")"<<endl;
+
+      // Create the thread
+      CTester tst( this, *pTest1, *pTest2, 
+		   std::pair<unsigned int, unsigned int>( nBeg, nEnd ), pred );
+      shared_ptr< boost::thread > t( new boost::thread( tst ) );
+      threads.push_back( t );
+      nBeg = nEnd;
+    }
+
+  // Wait for the threads to finish
+  for( unsigned int i = 0; i < nThreads; i++ )
+    threads[i]->join();
+
+  cout<<"Threads finished"<<endl;
+
+  // Compute the loss
+  cout<<"Computing the loss"<<endl;
+  vector< double > res( n );
+  for( unsigned int i = 0; i < n; i++ )
+    {
+      unsigned int yi = pTest1->map( i );
+
+      // Save the predictions as necessary
+      if( true_fname.length() > 0 && pred_fname.length() > 0 )
+	{
+	  pO->displaySample( yi, ofs_true );
+	  pO->displaySample( pred[i], ofs_pred );
+	}  
+
+      res[i] = pTest1->oloss( yi, pred[i] );
+    }
+
+  if( true_fname.length() > 0 && pred_fname.length() > 0 )
+    {
+      ofs_true.close();
+      ofs_pred.close();
+    }
+
+  return res;
+}
+
+// Saves the classifier to a file
+template< typename _I1, typename _I2, typename _O >
+void CCOSVM<_I1,_I2,_O>::save( const string& filename ) const
+{
+  boost::iostreams::filtering_ostream ofs;
+  openWriteFile( filename, ofs );
+  //  std::ofstream ofs( filename.c_str() );
+  cout<<"Saving the current model to "<<filename<<endl;
+
+  // Display some statistics about the dataset
+  ofs<<pds1->sizeI()<<" "<<pds2->sizeI()<<" "<<pds1->sizeO()<<" ";
+  ofs<<nFeats( *pds1->getI() )<<" "<<nFeats( *pds2->getI() )<<" ";
+  ofs<<nFeats( *pds1->getO() )<<endl;
+
+  // Output alpha1
+  for( unsigned int i = 0; i < alpha1.size(); i++ )
+    {
+      for( svec_t::const_iterator iter = alpha1[i].begin(); iter != alpha1[i].end(); iter++ )
+	ofs<<iter->first<<" "<<iter->second<<" ";
+      ofs<<endl;
+    }
+
+  // Output alpha2
+  for( unsigned int i = 0; i < alpha2.size(); i++ )
+    {
+      for( svec_t::const_iterator iter = alpha2[i].begin(); iter != alpha2[i].end(); iter++ )
+	ofs<<iter->first<<" "<<iter->second<<" ";
+      ofs<<endl;
+    }
+
+  // Output yassign1
+  for( uumap_t::const_iterator iter = yassign1.begin(); iter != yassign1.end(); iter++ )
+    ofs<<iter->first<<" "<<iter->second<<" ";
+  ofs<<endl;
+
+  // Output yassign2
+  for( uumap_t::const_iterator iter = yassign2.begin(); iter != yassign2.end(); iter++ )
+    ofs<<iter->first<<" "<<iter->second<<" ";
+  ofs<<endl;
+
+  ofs<<"end"<<endl;
+  boost::iostreams::close( ofs );
+}
+
+template< typename _I1, typename _I2, typename _O >
+bool CCOSVM<_I1,_I2,_O>::load( const string& filename )
+{
+  using spirit::parse;
+  using spirit::uint_p;
+  using spirit::real_p;
+  using spirit::blank_p;
+  using spirit::assign_a;
+  using spirit::push_back_a;
+
+  string s;
+  boost::iostreams::filtering_istream ifs;
+  if( openReadFile( filename, ifs ) == false ) return false;
+  //  std::ifstream ifs( filename.c_str() );
+  if( ifs.fail() ) return false;
+
+  // Retrieve the statistics about the data
+  std::getline( ifs, s );
+  if( ifs.fail() ) return false;
+  unsigned int n1, n2, no, f1, f2, fo;
+  if( parse( s.c_str(),
+	     ( uint_p[assign_a(n1)] >> *blank_p >>
+	       uint_p[assign_a(n2)] >> *blank_p >>
+	       uint_p[assign_a(no)] >> *blank_p >>
+	       uint_p[assign_a(f1)] >> *blank_p >>
+	       uint_p[assign_a(f2)] >> *blank_p >>
+	       uint_p[assign_a(fo)] >> *blank_p )).full == false )
+    throw std::runtime_error( "Failed to parse data statistics" );
+
+  // Match the statistics against the associated dataset
+  if( pds1->sizeI() != n1 || pds2->sizeI() != n2 || pds1->sizeO() != no )
+    throw std::logic_error( "The number of examples in the file does not match the associated data" );
+  if( nFeats( *pds1->getI() ) != f1 || nFeats( *pds2->getI() ) != f2 ||
+      nFeats( *pds1->getO() ) != fo )
+    throw std::logic_error( "The number of features in the file does not match the associated data" );
+
+  vector< svec_t > a1( n1 );
+  vector< svec_t > a2( n2 );
+  uumap_t ya1, ya2;
+
+  // Parse alphas
+  for( unsigned int i = 0; i < n1+n2; i++ )
+    {
+      // Retrieve the next line
+      std::getline( ifs, s );
+      if( ifs.fail() ) return false;
+
+      // Parse the values
+      vector< unsigned int > keys;
+      vector< double > vals;
+      if( parse( s.c_str(),
+		 *( uint_p[push_back_a(keys)] >> *blank_p >>
+		    real_p[push_back_a(vals)] >> *blank_p ) ).full == false )
+	throw std::runtime_error( "Failed to parse alpha" );
+
+      // Add the values
+      if( i < n1 )
+	for( unsigned int j = 0; j < keys.size(); j++ )
+	  a1[i][keys[j]] = vals[j];
+      else
+	for( unsigned int j = 0; j < keys.size(); j++ )
+	  a2[i-n1][keys[j]] = vals[j];	
+    }
+
+  // Handle yassign1 and yassign2
+  for( unsigned int i = 0; i < 2; i++ )
+    {
+      // Retrieve the line
+      std::getline( ifs, s );
+      if( ifs.fail() ) return false;
+  
+      // Parse the values
+      vector< unsigned int > keys;
+      vector< unsigned int > vals;
+      if( parse( s.c_str(),
+		 *( uint_p[push_back_a(keys)] >> *blank_p >>
+		    uint_p[push_back_a(vals)] >> *blank_p ) ).full == false )
+	{
+	  cout<<i<<endl;
+	  throw std::runtime_error( "Failed to parse yassign" );
+	}
+
+      // Store the values
+      if( i == 0 )
+	for( unsigned int j = 0; j < keys.size(); j++ )
+	  ya1[ keys[j] ] = vals[j];
+      else
+	for( unsigned int j = 0; j < keys.size(); j++ )
+	  ya2[ keys[j] ] = vals[j];
+    }
+
+  // Parse the final line
+  std::getline( ifs, s );
+  if( ifs.fail() ) return false;
+  if( s != "end" ) return false;
+
+  boost::iostreams::close( ifs );
+
+  // Setup the data structures
+  alpha1.swap( a1 ); alpha2.swap( a2 );
+  yassign1.swap( ya1 ); yassign2.swap( ya2 );
+
+  // Update the sums
+  asum1.clear(); asum1.resize( n1 );
+  asum2.clear(); asum2.resize( n2 );
+  for( unsigned int xk = 0; xk < n1; xk++ ) updateSum( _v1, xk );
+  for( unsigned int xk = 0; xk < n2; xk++ ) updateSum( _v2, xk );
+
+  return true;
+}
+
+template< typename _I1, typename _I2, typename _O >
+int CCOSVM<_I1,_I2,_O>::preload()
+{
+  // Find the latest file
+  int iLatest = -1;
+  while( true )
+    {
+      string fname = params.fnPrefix + "_iter" + boost::lexical_cast<string>( iLatest+1 ) + ".gz";
+      std::ifstream ifs( fname.c_str() );
+      if( ifs.fail() == true ) break;
+      else iLatest++;
+    }
+  cout<<"Latest available iteration is "<<iLatest<<endl;
+
+  // Attempt to load the precomputed stuff
+  for( int i = iLatest; i >= 0; --i )
+    {
+      string fname = params.fnPrefix + "_iter" + boost::lexical_cast<string>( i ) + ".gz";
+      bool b = load( fname );
+      if( b == true ) return i;
+    }
+
+  return -1;
+}
+
+// Inference for a test sample
+template< typename _I1, typename _I2, typename _O >
+template< typename _T1, typename _T2 >
+unsigned int CCOSVM<_I1,_I2,_O>::infer( _T1 x1, _T2 x2 ) const
+{
+  if( pds1->getO()->size() < 1 ) throw std::logic_error( "Output space must have at least one sample" );
+
+  unsigned int no = pds1->getO()->size();
+
+  // Split the output space into ranges
+  unsigned int q2 = no / 2;
+  unsigned int q1 = q2 / 2;
+  unsigned int q3 = (q2 + no) / 2;
+  std::pair< unsigned int, unsigned int > range1( 0, q1 );
+  std::pair< unsigned int, unsigned int > range2( q1, q2 );
+  std::pair< unsigned int, unsigned int > range3( q2, q3 );
+  std::pair< unsigned int, unsigned int > range4( q3, no );
+
+  // Run a separate thread on each range
+  vector<double> fvals( no );
+  CFComputerExt<_T1,_T2> fc1( this, x1, x2, range1, fvals );
+  CFComputerExt<_T1,_T2> fc2( this, x1, x2, range2, fvals );
+  CFComputerExt<_T1,_T2> fc3( this, x1, x2, range3, fvals );
+  CFComputerExt<_T1,_T2> fc4( this, x1, x2, range4, fvals );
+  boost::thread t1(fc1);
+  boost::thread t2(fc2);
+  boost::thread t3(fc3);
+  boost::thread t4(fc4);
+
+  // Wait for the threads to finish
+  t1.join(); t2.join(); t3.join(); t4.join();
+
+  // Perform the argmax
+  unsigned int f_argmax = 0;
+  double f_max = fvals[0];
+  for( unsigned int i = 1; i < no; i++ )
+    {
+      double val = fvals[i];
+      if( val > f_max )
+	{
+	  f_max = val;
+	  f_argmax = i;
+	}
+    }
+
+  return f_argmax;
+}
+
+template< typename _I1, typename _I2, typename _O >
+std::pair< unsigned int, unsigned int > CCOSVM<_I1,_I2,_O>::mapUnlab( const string& id ) const
+{
+  // Find the id in both datasets
+  int i1 = pds1->s2i( id );
+  int i2 = pds2->s2i( id );
+
+  if( i1 < 0 || i2 < 0 )
+    throw std::logic_error( "Failed to locate the sample" );
+  if( i1 != i2 )
+    throw std::logic_error( "Inconsistent datasets" );
+  if( pds1->map( i1 ) != std::numeric_limits<unsigned int>::max() ||
+      pds2->map( i2 ) != std::numeric_limits<unsigned int>::max() )
+    throw std::logic_error( "The sample was not provided to training as unlabeled" );
+
+  // Fetch the mappings
+  uumap_t::const_iterator iter1 = yassign1.find( i1 );
+  uumap_t::const_iterator iter2 = yassign2.find( i2 );
+  if( iter1 == yassign1.end() )
+    throw std::logic_error( "No label was inferred by view 1" );
+  if( iter2 == yassign2.end() )
+    throw std::logic_error( "No label was inferred by view 2" );
+  
+  std::pair< unsigned int, unsigned int> res( iter1->second, iter2->second );
+  return res;
+}
+
+template< typename _I1, typename _I2 >
+CDataSet<CSparseSample> predScores( const CCOSVM< _I1, _I2, CSparseSample >& clsf, shared_ptr< const CDataSet<_I1> > pds1, shared_ptr< const CDataSet<_I2> > pds2 )
+{
+  // Retrieve the relevant info structures
+  shared_ptr< CDataSet<CSparseSample> const > pO = clsf.getOutputSpace();
+  shared_ptr< CFeatMap const > pfm = pO->getSample( 0 )->getFeatMap();
+  const CDataSet<_I1>& ds1 = *pds1;
+  const CDataSet<_I2>& ds2 = *pds2;
+  unsigned int nO = pO->size();
+  unsigned int nTest = ds1.size();
+
+  // Verify consistency
+  if( ds2.size() != nTest )
+    throw std::logic_error( "Unsynchronized test sets in predScores()" );
+
+  CDataSet<CSparseSample> dsRes;
+  
+  // Handle the degenerate case
+  if( nO == 0 ) return dsRes;
+
+  // Determine the set of output-space features that have both positive and negative representation
+  vector< string > vFeats;
+  for( unsigned int i = 0; i < pfm->nFeats(); ++i )
+    {
+      string f = pfm->i2f( i );
+      if( nSamplesWFeat( *pO, f ) == 0 ) continue;	// No positives
+      if( nSamplesWFeat( *pO, f ) == nO ) continue;	// No negatives
+      vFeats.push_back( f );
+    }
+
+  // Precompute the full compatibility score matrix
+  vector< double > matF( nTest * nO );
+  for( unsigned int i = 0; i < nTest; ++i )
+    {
+      // Display progress
+      if( (i % 100) == 0 ) {cout<<"."; cout.flush();}
+
+      for( unsigned int j = 0; j < nO; ++j )
+	{
+	  pair< const CDataSet<_I1>&, unsigned int > x1( ds1, i );
+	  pair< const CDataSet<_I2>&, unsigned int > x2( ds2, i );
+	  matF[ i*nO + j ] = clsf.f( x1, x2, j );
+	}
+    }
+
+  // Common feature map for the scores
+  shared_ptr<CFeatMap> pfmScores( new CFeatMap(vFeats) );
+
+  // Traverse the test samples and compute the scores
+  for( unsigned int i = 0; i < nTest; ++i )
+    {
+      // Display progress
+      if( (i % 100) == 0 ) {cout<<"."; cout.flush();}
+
+      // Create the sample
+      string name = ds1.i2s( i );
+      if( ds2.i2s( i ) != name )
+	throw std::logic_error( "Unsynchronized test sets in predScores()" );
+      auto_ptr< CSparseSample > psmpl( new CSparseSample(pfmScores) );
+
+      // Traverse the features
+      for( vector< string >::const_iterator iter = vFeats.begin();
+	   iter != vFeats.end(); ++iter )
+	{
+	  // Compute the score
+	  double fPos = -1.0 * std::numeric_limits< double >::infinity();
+	  double fNeg = fPos;
+	  for( unsigned int oi = 0; oi < nO; ++oi )
+	    {
+	      double f_val = matF[ i*nO + oi ];
+	      if( pO->getSample(oi)->getValue( *iter ) != 0.0 )
+		{ if( f_val > fPos ) fPos = f_val; }
+	      else
+		{ if( f_val > fNeg ) fNeg = f_val; }
+	    }
+
+	  double score = fPos - fNeg;
+	  psmpl->setValue( *iter, score );
+	}
+      dsRes.addSample( name, psmpl );
+    }
+  cout<<endl;
+  return dsRes;
+}
+
+#endif

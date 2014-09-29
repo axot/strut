@@ -1,0 +1,91 @@
+// -*-c++-*-
+/// \file sample_impl
+/// \brief Templated implementation of routines associated with CSparseSample
+/// \author Artem Sokolov
+
+#ifndef SAMPLE_IMPL__INCLUDED
+#define SAMPLE_IMPL__INCLUDED
+
+template< typename _I >
+void predScores( const CClassifier<_I, CSparseSample>& clsf, shared_ptr< const CDataSet<_I> > pdsTest, const string& fnOutput )
+{
+  CDataSet<CSparseSample> ds = predScores( clsf, pdsTest );
+  ds.save( fnOutput );
+}
+
+template< typename _I >
+CDataSet<CSparseSample> predScores( const CClassifier<_I, CSparseSample>& clsf, shared_ptr< const CDataSet<_I> > pdsTest )
+{
+  // Retrieve the relevant info structures
+  shared_ptr< const CIODataSet<_I, CSparseSample > > pIO = clsf.getDataSet();
+  shared_ptr< CDataSet<CSparseSample> const > pO = pIO->getO();
+  shared_ptr< CFeatMap const > pfm = pO->getSample( 0 )->getFeatMap();
+  const CDataSet<_I>& dsTest = *pdsTest;
+  unsigned int nO = pO->size();
+  unsigned int nTest = pdsTest->size();
+
+  CDataSet<CSparseSample> dsRes;
+  
+  // Handle degenerate case
+  if( nO == 0 ) return dsRes;
+
+  // Determine the set of output-space features that have both positive and negative representation
+  vector< string > vFeats;
+  for( unsigned int i = 0; i < pfm->nFeats(); ++i )
+    {
+      string f = pfm->i2f( i );
+      if( nSamplesWFeat( *pO, f ) == 0 ) continue;	// No positives
+      if( nSamplesWFeat( *pO, f ) == nO ) continue;	// No negatives
+      vFeats.push_back( f );
+    }
+
+  // Precompute the full compatibility score matrix
+  vector< double > matF( nTest * nO );
+  for( unsigned int i = 0; i < nTest; ++i )
+    {
+      // Display progress
+      if( (i % 100) == 0 ) {cout<<"."; cout.flush();}
+
+      for( unsigned int j = 0; j < nO; ++j )
+	matF[ i*nO + j ] = clsf.f( dsTest, i, j );
+    }
+
+  // Common feature map for the scores
+  shared_ptr<CFeatMap> pfmScores( new CFeatMap(vFeats) );
+
+  // Traverse the test samples and compute the scores
+  for( unsigned int i = 0; i < nTest; ++i )
+    {
+      // Display progress
+      if( (i % 100) == 0 ) {cout<<"."; cout.flush();}
+
+      // Create the sample
+      string name = pdsTest->i2s( i );
+      auto_ptr< CSparseSample > psmpl( new CSparseSample(pfmScores) );
+
+      // Traverse the features
+      for( vector< string >::const_iterator iter = vFeats.begin();
+	   iter != vFeats.end(); ++iter )
+	{
+	  // Compute the score
+	  double fPos = -1.0 * std::numeric_limits< double >::infinity();
+	  double fNeg = fPos;
+	  for( unsigned int oi = 0; oi < nO; ++oi )
+	    {
+	      double f_val = matF[ i*nO + oi ];
+	      if( pO->getSample(oi)->getValue( *iter ) != 0.0 )
+		{ if( f_val > fPos ) fPos = f_val; }
+	      else
+		{ if( f_val > fNeg ) fNeg = f_val; }
+	    }
+
+	  double score = fPos - fNeg;
+	  psmpl->setValue( *iter, score );
+	}
+      dsRes.addSample( name, psmpl );
+    }
+  cout<<endl;
+  return dsRes;
+}
+
+#endif

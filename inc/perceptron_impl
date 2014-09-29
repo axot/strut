@@ -1,0 +1,153 @@
+// perceptron_impl - templated implementation of CPerceptron -*-c++-*-
+//
+// by Artem Sokolov
+
+#ifndef PERCEPTRON_IMPL__INCLUDED
+#define PERCEPTRON_IMPL__INCLUDED
+
+using std::cout;
+using std::endl;
+
+// Constructor
+template< typename _I, typename _O >
+CPerceptron<_I, _O>::CPerceptron( const SPerceptronParams& pp )
+  : CClassifier<_I, _O>( "Perceptron" )
+{
+  params = pp;
+}
+
+// Training
+template< typename _I, typename _O >
+void CPerceptron<_I, _O>::train()
+{
+  const unsigned int n = this->pdsTrain->sizeI();
+
+  // Clear all the previous coefficients
+  alpha.clear();
+
+  string msg = "Training on " + boost::lexical_cast<string>( n ) +
+    " samples using margin value of " + boost::lexical_cast<string>( params.margin );
+  this->displayMessage( msg );
+
+  for( unsigned int i = 1; i <= 5; i++ )
+    {
+      double cum_loss = 0.0;
+
+      // Loop over the training samples
+      for( unsigned int xi = 0; xi < n; xi++ )
+	{
+	  // Display progress
+	  if( xi % 100 == 0 )
+	    { std::cout<<"."; std::cout.flush(); }
+
+	  // Traverse the possible outputs
+	  cum_loss += singleUpdate( xi );
+	}  
+
+      std::cout<<std::endl;
+
+      std::cout<<"Cumulative loss after this iteration : "<<cum_loss<<std::endl;
+    }
+}
+
+// Displays the coefficients to an arbitrary output stream
+template< typename _I, typename _O >
+void CPerceptron<_I, _O>::display( std::ostream& os ) const
+{
+  for( smat_t::const_iterator iter = alpha.begin(); iter != alpha.end(); iter++ )
+    os<<"("<<iter->first.first<<","<<iter->first.second<<"):"<<iter->second<<"  ";
+  os<<std::endl;
+}
+
+// Update based on a single example
+template< typename _I, typename _O >
+double CPerceptron<_I,_O>::singleUpdate( unsigned int dsi, double pen_scale )
+{
+  // Retrieve the true label
+  unsigned int true_yi = this->pdsTrain->map( dsi );
+
+  // Determine the current fold and desired margin
+  double mar = params.margin;
+
+  // Compute the top two scoring labels
+  double f1 = -1.0 * std::numeric_limits<double>::infinity();
+  double f2 = f1;
+  unsigned int i1 = 0;
+  unsigned int i2 = 0;
+
+  // Traverse the possible outputs
+  unsigned int nOutputs = this->pdsTrain->getO()->size();
+  for( unsigned int yi = 0; yi < nOutputs; yi++ )
+    {
+      // Compute the value of the compatiblity function f
+      double f_val = this->CClassifier<_I,_O>::f( dsi, yi );
+
+      // Compare to the best seen so far
+      if( f_val > f1 )
+	{
+	  // The top best becomes second best
+	  i2 = i1; f2 = f1;
+
+	  // Store the new top best
+	  i1 = yi; f1 = f_val;
+	}
+      // Worse than top best but better than second best
+      else if( f_val > f2 ) { i2 = yi; f2 = f_val; }
+    }      
+
+  // Compute the loss and the margin
+  double pred_loss = this->pdsTrain->getO()->loss( true_yi, i1 );
+  double pred_mar = f1 - f2;
+
+  // Determine the penalty
+  double pos_penalty = 1.0;
+  double neg_penalty = -1.0;
+  if( params.bLossUpdate == true ) neg_penalty = -pred_loss;
+
+  // Scale the penalties
+  pos_penalty *= pen_scale;
+  neg_penalty *= pen_scale;
+  
+  // Perform the update if the prediction is incorrect
+  if( true_yi != i1 )
+    {
+      updateAlpha( dsi, true_yi, pos_penalty );
+      updateAlpha( dsi, i1, neg_penalty );
+    }
+
+  // Perform the update if the prediction is correct, but there's a margin violation
+  else if( pred_mar < mar )
+    {
+      updateAlpha( dsi, true_yi, pos_penalty );
+      updateAlpha( dsi, i2, neg_penalty );
+    }
+
+  return pred_loss;
+}
+
+// Updates alpha_ij by delta
+template< typename _I, typename _O >
+void CPerceptron<_I,_O>::updateAlpha( int i, int j, double delta )
+{
+  std::pair<int, int> key( i, j );
+  if( alpha.find( key ) == alpha.end() )
+    alpha[key] = delta;
+  else
+    alpha[key] += delta;
+}
+
+// Computes the compatibility function value between internal samples
+template< typename _I, typename _O >
+double CPerceptron<_I,_O>::f( pair< const CDataSet<_I>&, unsigned int > x, unsigned int dso ) const
+{
+  double res = 0.0;
+  for( smat_t::const_iterator iter = alpha.begin(); iter != alpha.end(); iter++ )
+    {
+      unsigned int xj = iter->first.first;
+      unsigned int yj = iter->first.second;
+      res += iter->second * this->pdsTrain->iokernel( xj, yj, x, dso );
+    }
+  return res;
+}
+
+#endif

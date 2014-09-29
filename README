@@ -1,0 +1,5 @@
+To make the project, use the following commands:
+
+make-dep > Makefile
+make
+

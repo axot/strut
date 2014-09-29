@@ -1,0 +1,96 @@
+LIBFLAGS = -lboost_iostreams -lboost_program_options -lboost_thread-mt -lboost_system
+CPPFLAGS = -O3 -Wall -Iinc
+
+COMMON_OBJ = obj/misc.o obj/sample.o obj/go-container.o obj/go-annotation.o obj/blastout.o obj/params.o obj/parsers.o obj/featmap.o obj/eval.o obj/cv.o
+
+all : \
+	bin/gostruct \
+	bin/gostruct-dataprep \
+	bin/mousefunc \
+	bin/mousefunc-score \
+	bin/mview \
+	bin/mview-dataprep \
+	bin/mview-dataprep-mouse \
+	bin/dsdiff \
+	bin/yeast-dataprep \
+	bin/yeast \
+	bin/cafa-dataprep \
+	bin/cafa-cv \
+	bin/cafa-train \
+	bin/cafa-train-ppi \
+	bin/cafa-pred \
+	bin/cafa-pred-ppi \
+	bin/cafa-post \
+	bin/format-conv \
+	bin/strip-fasta
+#	bin/sandbox
+
+bin/gostruct : obj/gostruct.o $(COMMON_OBJ)
+	g++ -o $@ $^ $(LIBFLAGS)
+
+bin/gostruct-dataprep : obj/gostruct-dataprep.o $(COMMON_OBJ)
+	g++ -o $@ $^ $(LIBFLAGS)
+
+bin/mousefunc : obj/mousefunc.o $(COMMON_OBJ)
+	g++ -o $@ $^ $(LIBFLAGS)
+
+bin/mousefunc-score : obj/mousefunc-score.o $(COMMON_OBJ)
+	g++ -o $@ $^ $(LIBFLAGS)
+
+bin/mview : obj/mview.o $(COMMON_OBJ)
+	g++ -o $@ $^ $(LIBFLAGS)
+
+bin/mview-dataprep : obj/mview-dataprep.o $(COMMON_OBJ)
+	g++ -o $@ $^ $(LIBFLAGS)
+
+bin/mview-dataprep-mouse : obj/mview-dataprep-mouse.o $(COMMON_OBJ)
+	g++ -o $@ $^ $(LIBFLAGS)
+
+bin/dsdiff : obj/dsdiff.o $(COMMON_OBJ)
+	g++ -o $@ $^ $(LIBFLAGS)
+
+bin/yeast-dataprep : obj/yeast-dataprep.o $(COMMON_OBJ)
+	g++ -o $@ $^ $(LIBFLAGS)
+
+bin/yeast : obj/yeast.o $(COMMON_OBJ)
+	g++ -o $@ $^ $(LIBFLAGS)
+
+#bin/mouse : obj/mouse.o $(COMMON_OBJ)
+#	g++ -o $@ $^ $(LIBFLAGS)
+
+bin/cafa-dataprep : obj/cafa-dataprep.o $(COMMON_OBJ)
+	g++ -o $@ $^ $(LIBFLAGS)
+
+bin/cafa-cv : obj/cafa-cv.o $(COMMON_OBJ)
+	g++ -o $@ $^ $(LIBFLAGS)
+
+bin/cafa-train : obj/cafa-train.o $(COMMON_OBJ)
+	g++ -o $@ $^ $(LIBFLAGS)
+
+bin/cafa-train-ppi : obj/cafa-train-ppi.o $(COMMON_OBJ)
+	g++ -o $@ $^ $(LIBFLAGS)
+
+bin/cafa-pred : obj/cafa-pred.o $(COMMON_OBJ)
+	g++ -o $@ $^ $(LIBFLAGS)
+
+bin/cafa-pred-ppi : obj/cafa-pred-ppi.o $(COMMON_OBJ)
+	g++ -o $@ $^ $(LIBFLAGS)
+
+bin/cafa-post : obj/cafa-post.o $(COMMON_OBJ)
+	g++ -o $@ $^ $(LIBFLAGS)
+
+bin/format-conv : obj/format-conv.o $(COMMON_OBJ)
+	g++ -o $@ $^ $(LIBFLAGS)
+
+bin/strip-fasta : obj/strip-fasta.o $(COMMON_OBJ)
+	g++ -o $@ $^ $(LIBFLAGS)
+
+# Misc
+
+clean :
+	rm obj/* bin/*
+
+linecount : 
+	cat src/*.cpp inc/*_impl inc/*.h | wc -l
+
+

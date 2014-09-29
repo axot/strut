@@ -1,0 +1,417 @@
+// -*-c++-*-
+/// \file dataset_impl
+/// \brief Templated implementation of CDataSet 
+/// \author Artem Sokolov
+
+#ifndef DATASET_IMPL__INCLUDED
+#define DATASET_IMPL__INCLUDED
+
+#include <fstream>
+
+// Copy constructor
+template< typename _T >
+CDataSet<_T>::CDataSet( const CDataSet<_T>& other )
+  : sampleIDs( other.sampleIDs ),
+    i_sampleIDs( other.i_sampleIDs ),
+    fker( other.fker ),
+    floss( other.floss ),
+    isCached( false )
+{
+  // Deep copy the samples
+  for( unsigned int i = 0; i < other.size(); i++ )
+    {
+      shared_ptr< _T const > p = other.getSample( i );
+      shared_ptr<_T> s( new _T( *p ) );
+      samples.push_back( s );
+    }
+}
+
+// Assignment operator
+template< typename _T >
+CDataSet<_T>& CDataSet<_T>::operator=( const CDataSet<_T>& other )
+{
+  if( this == &other ) return *this;
+
+  sampleIDs = other.sampleIDs;
+  i_sampleIDs = other.i_sampleIDs;
+  fker = other.fker;
+  floss = other.floss;
+  isCached = false;
+
+  // Deep copy the samples
+  samples.clear();
+  for( unsigned int i = 0; i < other.size(); i++ )
+    {
+      shared_ptr< _T const > p = other.getSample( i );
+      shared_ptr<_T> s( new _T( *p ) );
+      samples.push_back( s );
+    }
+
+  return *this;
+}
+
+////////////////////////////////////////////////////////////////
+// Displays local samples to an arbitrary output stream
+template< typename _T >
+void CDataSet<_T>::displaySamples( vector< string > ids, std::ostream& os ) const
+{
+  for( unsigned int i = 0; i < ids.size(); i++ )
+    {
+      int j = s2i( ids[i] );
+      if( j >= 0 ) displaySample( j, os );
+    }
+}
+
+// Clears the dataset
+template< typename _T >
+void CDataSet<_T>::clear()
+{
+  CCacheInvalidator( this );
+
+  sampleIDs.clear();
+  i_sampleIDs.clear();
+  samples.clear();
+}
+
+// Adds a pre-created sample to the data set
+// bOverwrite specifies whether a sample with sampleID is to be overwritten if it already exists
+template< typename _T >
+void CDataSet<_T>::addSample( const string& sampleID,
+			      shared_ptr<_T> sample,
+			      bool bOverwrite )
+{
+  CCacheInvalidator( this );
+
+  // Determine if sampleID already exists in the dataset
+  simap_t::const_iterator p_iter = i_sampleIDs.find( sampleID );
+
+  // Case 1: pattern already exists in the dataset
+  if( p_iter != i_sampleIDs.end() )
+    {
+      if( bOverwrite == false ) return;
+      samples[ p_iter->second ] = sample;
+    }
+
+  // Case 2: pattern does not exist in the dataset
+  else
+    {
+      // Add the sample ID to the dataset
+      int pid_i = sampleIDs.size();
+      sampleIDs.push_back( sampleID );
+      i_sampleIDs[ sampleID ] = pid_i;
+
+      // Add the sample
+      samples.push_back( sample );
+    }
+}
+
+// Same as above but adds a copy of the sample
+template< typename _T >
+void CDataSet<_T>::addSampleConst( const string& sampleID,
+				   shared_ptr<const _T> sample,
+				   bool bOverwrite )
+{
+  CCacheInvalidator( this );
+
+  // Create a copy of the sample
+  shared_ptr<_T> s( new _T( *sample ) );
+
+  // Add the sample
+  addSample( sampleID, s, bOverwrite );
+}
+
+
+// Adds i^th sample of the other dataset to this one
+template< typename _T >
+void CDataSet<_T>::addSample( shared_ptr< CDataSet<_T> const > other,
+			      unsigned int i, bool bOverwrite,
+			      const string& sampleID )
+{
+  CCacheInvalidator( this );
+
+  // Retrieve the name of the sample
+  string id;
+  if( sampleID.length() > 0 ) id = sampleID;
+  else id = other->sampleIDs[i];
+
+  // Retrieve the sample itself and make a copy
+  shared_ptr<_T> s = other->samples[i];
+  shared_ptr<_T> p( new _T( *s ) );
+
+  // Add the sample
+  addSample( id, p, bOverwrite );
+}
+
+// Adds another dataset to this one
+template< typename _T >
+void CDataSet<_T>::addSet( shared_ptr< CDataSet<_T> const > other,
+			   bool bOverwrite, const string& appendID )
+{
+  CCacheInvalidator( this );
+
+  for( unsigned int i = 0; i < other->size(); i++ )
+    {
+      // Modify the sample ID if necessary
+      string id = other->sampleIDs[i];
+      if( appendID.length() > 0 ) id += appendID; 
+
+      this->addSample( other, i, bOverwrite, id );
+    }
+}
+
+////////////////////////////////////////////////////////////////
+
+// Subsamples the dataset
+template< typename _T >
+void CDataSet<_T>::subsample( const vector< unsigned int >& indices )
+{
+  CCacheInvalidator( this );
+
+  // Generate the new maps
+  vector< string > new_sampleIDs;
+  vector< shared_ptr<_T> > new_samples;
+
+  // Subsample
+  for( vector<unsigned int>::const_iterator iter = indices.begin();
+       iter != indices.end(); iter++ )
+    {
+      new_sampleIDs.push_back( sampleIDs[*iter] );
+      new_samples.push_back( samples[*iter] );
+    }
+
+  // Reset the maps
+  sampleIDs.swap( new_sampleIDs );
+  samples.swap( new_samples );
+
+  // Rebuild the inverse name map
+  i_sampleIDs.clear();
+  for( unsigned int i = 0; i < sampleIDs.size(); i++ )
+    i_sampleIDs[ sampleIDs[i] ] = i;
+}
+
+// Subsamples the dataset by sample IDs
+template< typename _T >
+void CDataSet<_T>::subsample( const vector< string >& ids, bool strict )
+{
+  CCacheInvalidator( this );
+
+  // Traverse the ids and convert them to indices
+  vector< unsigned int > v;
+  for( unsigned int i = 0; i < ids.size(); i++ )
+    {
+      int k = this->s2i( ids[i] );
+      if( k < 0 )
+	{
+	  if( strict == true )
+	    throw std::logic_error( "Failed to locate " + ids[i] + " in the dataset" );
+	  // otherwise ignore the id
+	}
+      else
+	v.push_back( k );
+    }
+  this->subsample(v);
+}
+
+//////////////////////////////////////////////////////////////////////////
+
+// Looks up the pattern index by the pattern name, returns -1 if no such pattern
+template< typename _T >
+int CDataSet<_T>::s2i( const string& s ) const
+{
+  simap_t::const_iterator iter = i_sampleIDs.find( s );
+  if( iter == i_sampleIDs.end() ) return -1;
+  else return iter->second;
+}
+
+// Looks up the pattern name by its index
+template< typename _T >
+const string CDataSet<_T>::i2s( unsigned int i ) const
+{
+  if( i >= sampleIDs.size() ) return string("");
+  else return sampleIDs[i];
+}
+
+// Renames the i^th sample to s
+template< typename _T >
+void CDataSet<_T>::rename( unsigned int i, const string& s )
+{
+  CCacheInvalidator( this );
+
+  // Check if the name is different than what's already there
+  if( sampleIDs[i] == s ) return;
+
+  // Check for collisions
+  if( i_sampleIDs.find( s ) != i_sampleIDs.end() )
+    throw std::logic_error( "Failed to rename a sample. Name already exists" );
+
+  // Update the backward map
+  i_sampleIDs.erase( sampleIDs[i] );
+  i_sampleIDs[s] = i;
+
+  // Update the forward map
+  sampleIDs[i] = s;
+}
+
+// Returns index of the sample
+// Returns -1 if there is no match
+template< typename _T >
+int CDataSet<_T>::findSample( shared_ptr< _T const > smpl ) const
+{
+  for( unsigned int i = 0; i < this->size(); i++ )
+    {
+      if( *(this->getSample(i)) == *(smpl) ) return static_cast<int>(i);
+    }
+
+  return -1;
+}
+
+//////////////////////////////////////////////////////////////////////////
+
+/// Computes the kernel value between the i^th sample and a sample from another dataset
+template< typename _T >
+double CDataSet<_T>::kernel( unsigned int i, const CDataSet<_T>& other, unsigned int j ) const
+{
+  // Retrieve the cached value if available
+  if( &other == this && isCached == true )
+    return kernelCache[i * this->size() + j];
+  else if( &other == pExt.get() )
+    {
+      unsigned int m = pExt->size();
+      return externalCache[ i*m + j ];
+    }
+  else
+    {
+      shared_ptr< const _T > smpl = other.getSample( j );
+      return fker( *samples[i], *smpl );
+    }
+}
+
+/// Computes the loss between the i^th and j^th samples
+template< typename _T >
+double CDataSet<_T>::loss( unsigned int i, unsigned j ) const
+{
+  if( isCached == true ) return lossCache[i * this->size() + j];
+  else return floss( *(samples[i]), *(samples[j]) );
+}
+
+// Computes the average loss per sample, given the truth
+template< typename _T >
+double CDataSet<_T>::loss( const CDataSet<_T>& truth ) const
+{
+  double sum = 0.0;
+  for( unsigned int i = 0; i < truth.size(); i++ )
+    {
+      // Locate the sample locally
+      string name = truth.i2s( i );
+      int j = this->s2i( name );
+      if( j < 0 ) throw std::logic_error( "CDataSet::loss(): No such sample" );
+
+      // Translate the foreign sample to the local context
+      shared_ptr<const _T> p = truth.getSample( i );
+      sum += loss( j, p );
+    }
+  return sum / static_cast<double>(size());
+}
+
+// Caches the kernel and the loss matrices
+template< typename _T >
+void CDataSet<_T>::cache()
+{
+  // Nothing to do if the cache is already valid
+  if( isCached == true ) return;
+
+  // Set up the matrix sizes
+  const unsigned int n = this->size();
+  kernelCache.resize( n*n );
+  lossCache.resize( n*n );
+
+  // Cache the kernel matrix
+  std::cout<<"Caching the kernel matrix";
+  for( unsigned int i = 0; i < n; i++ )
+    {
+      // Display progress
+      if( i % 100 == 0 ) { std::cout<<"."; std::cout.flush(); }
+      
+      // Compute the lower triangle
+      const unsigned int r = i * n;
+      for( unsigned int j = 0; j <= i; j++ )
+	kernelCache[r+j] = kernel( i, *this, j );
+    }
+  std::cout<<std::endl;
+
+  // Reflect the matrix
+  for( unsigned int i = 0; i < (n-1); i++ )
+    for( unsigned int j = i+1; j < n; j++ )
+      kernelCache[i*n+j] = kernelCache[j*n+i];
+
+  std::cout<<"Caching the loss matrix";
+  for( unsigned int i = 0; i < n; i++ )
+    {
+      // Display progress
+      if( i % 100 == 0 ) { std::cout<<"."; std::cout.flush(); }
+
+      // Compute the lower triangle
+      const unsigned int r = i * n;
+      for( unsigned int j = 0; j <= i; j++ )
+	lossCache[r+j] = loss( i, j );
+    }
+  std::cout<<std::endl;
+
+  // Reflect the matrix
+  for( unsigned int i = 0; i < (n-1); i++ )
+    for( unsigned int j = i+1; j < n; j++ )
+      lossCache[i*n+j] = lossCache[j*n+i];
+
+  isCached = true;
+}
+
+// Caches kernel vales against an external dataset
+template< typename _T >
+void CDataSet<_T>::cacheExternal( shared_ptr< const CDataSet<_T> > pExtDS )
+{
+  // Save a pointer to the external dataset
+  pExt = pExtDS;
+
+  if( !pExt ) return;
+  cout<<"Caching against an external kernel matrix";
+
+  // Resize the cache storage
+  unsigned int n = this->size();
+  unsigned int m = pExtDS->size();
+  externalCache.resize( n*m );
+
+  // Populate the matrix
+  for( unsigned int i = 0; i < n; i++ )
+    {
+      // Display progress
+      if( i % 100 == 0 ) { std::cout<<"."; std::cout.flush(); }
+
+      // Compute and store the value
+      const unsigned int r = i*m;
+      for( unsigned int j = 0; j < m; j++ )
+	externalCache[r+j] = fker( *samples[i], *(pExtDS->getSample(j)) );
+    }
+  cout<<endl;
+}
+
+///////////////////////////////////////////////////////////////////////////////
+
+// Computes a set of common sample IDs with another dataset
+template< typename _T >
+vector< string > commonSampleIDs( const CDataSet<_T>& pds1, 
+				  const CDataSet<_T>& pds2 )
+{
+  // Retrieve the sample IDs
+  vector<string> v1 = pds1.getSampleIDs();
+  vector<string> v2 = pds2.getSampleIDs();
+
+  // Compute the intersection
+  vector<string> res;
+  std::sort( v1.begin(), v1.end() );
+  std::sort( v2.begin(), v2.end() );
+  std::set_intersection( v1.begin(), v1.end(), v2.begin(), v2.end(),
+			 std::inserter( res, res.begin() ) );
+  return res;
+}
+
+#endif

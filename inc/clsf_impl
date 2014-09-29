@@ -1,0 +1,113 @@
+// -*-c++-*-
+/// \file clsf_impl
+/// \brief Templated implementation of CClassifier
+/// \author Artem Sokolov
+
+#ifndef CLSF_IMPL__INCLUDED
+#define CLSF_IMPL__INCLUDED
+
+#include <boost/thread.hpp>
+
+using std::cout;
+using std::endl;
+
+/// Trains the classifier on a specific dataset
+template< typename _I, typename _O >
+void CClassifier<_I, _O>::train( shared_ptr< const CIODataSet<_I,_O> > pds )
+{
+  clear();
+  pdsTrain = pds;
+  train();
+}
+
+// Tests the classifier on a new set of data
+template< typename _I, typename _O >
+std::vector<double> CClassifier<_I, _O>::test( shared_ptr< const CIODataSet<_I,_O> > dsTest, const string& fnPred ) const
+{
+  // Ensure the consistency of the output space
+  if( dsTest->getO() != pdsTrain->getO() )
+    throw std::logic_error( "Inconsistent output spaces" );
+
+  // Setup the loss vector
+  unsigned int nTest = dsTest->sizeI();
+  vector<double> loss( nTest );
+  vector< unsigned int > yPred = predict( dsTest->getI(), fnPred );
+
+  // Compute the loss
+  for( unsigned int i = 0; i < nTest; ++i )
+    {
+      unsigned int yi = dsTest->map( i );
+      loss[i] = dsTest->oloss( yi, yPred[i] );
+    }
+
+  cout<<endl;
+  return loss;
+}
+
+template< typename _I, typename _O >
+void CClassifier<_I, _O>::CTester::operator() ()
+{
+  // Traverse the samples
+  for( unsigned int xi = iRange.first; xi < iRange.second; xi++ )
+    {
+      // Display progress
+      if( (xi % 100) == 0 ) {std::cout<<"."; std::cout.flush();}
+
+      // Compute the prediction
+      res[xi] = clsf.infer( dsTest, xi );
+    }
+}
+
+
+template< typename _I, typename _O >
+vector<unsigned int> CClassifier<_I, _O>::predict( shared_ptr< const CDataSet<_I> > dsNew, const string& fnPred ) const
+{
+  unsigned int nTest = dsNew->size();
+  vector<unsigned int> yPred( nTest );
+
+  // Cache the kernel values between the training and test datasets
+  pdsTrain->cacheIExternal( dsNew );
+
+  // Split the range
+  const unsigned int nThreads = 8;
+  unsigned int nWhole = nTest / nThreads;
+  unsigned int nRemain = nTest - nThreads * nWhole;
+
+  // Create the threads
+  vector< shared_ptr< boost::thread> > threads;
+  unsigned int nStart = 0;
+  for( unsigned int i = 0; i < nThreads; i++ )
+    {
+      // Compute the range
+      unsigned int nEnd = nStart + nWhole;
+      if( i < nRemain ) nEnd++;
+      cout<<"Thread "<<i<<" will operate in ["<<nStart<<", "<<nEnd<<")"<<endl;
+      
+      // Create the thread
+      CTester tst( *this, *dsNew, 
+		   irange_t( nStart, nEnd ),
+		   irange_t( 0, pdsTrain->getO()->size() ),
+		   yPred );
+      shared_ptr< boost::thread > t( new boost::thread( tst ) );
+      threads.push_back( t );
+      nStart = nEnd;
+    }
+
+  // Wait for the threads to finish
+  for( unsigned int i = 0; i < nThreads; i++ )
+    threads[i]->join();
+
+  // Save the predictions as necessary
+  if( fnPred.empty() == false )
+    {
+      cout<<"Saving predictions to "<<fnPred<<endl;
+      std::ofstream ofPred( fnPred.c_str() );
+      for( unsigned int i = 0; i < nTest; ++i )
+	ofPred<<dsNew->i2s(i)<<","<<*(pdsTrain->getO()->getSample(yPred[i]));
+      ofPred.close();
+    }
+
+  return yPred;
+}
+
+#endif

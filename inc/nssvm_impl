@@ -1,0 +1,539 @@
+// -*-c++-*-
+/// \file nssvm_impl
+/// \brief Templated implementation of CnsSSVM
+/// \author Artem Sokolov
+
+#ifndef NSSVM_IMPL__INCLUDED
+#define NSSVM_IMPL__INCLUDED
+
+#include <map>
+
+#include <boost/spirit/include/classic.hpp>
+#include <boost/spirit/include/classic_file_iterator.hpp>
+#include <boost/spirit/include/classic_increment_actor.hpp>
+#include <boost/spirit/include/classic_clear_actor.hpp>
+namespace spirit = boost::spirit::classic;
+
+using std::map;
+using std::cout;
+using std::endl;
+
+template< typename _I, typename _O >
+int FLoopyOracle_m<_I,_O>::operator() ( unsigned int xi )
+{
+  shared_ptr< const CIODataSet<_I,_O> > pds = svm.getDataSet();
+  unsigned int yi = pds->map( xi );
+  unsigned int no = pds->getO()->size();
+
+  // Split the output space into ranges
+  unsigned int q2 = no / 2;
+  unsigned int q1 = q2 / 2;
+  unsigned int q3 = (q2 + no) / 2;
+  std::pair< unsigned int, unsigned int > range1( 0, q1 );
+  std::pair< unsigned int, unsigned int > range2( q1, q2 );
+  std::pair< unsigned int, unsigned int > range3( q2, q3 );
+  std::pair< unsigned int, unsigned int > range4( q3, no );
+
+  // Run a separate thread on each range
+  vector<double> fvals( no );
+  FFComputer<_I,_O> fc1( svm, xi, range1, fvals );
+  FFComputer<_I,_O> fc2( svm, xi, range2, fvals );
+  FFComputer<_I,_O> fc3( svm, xi, range3, fvals );
+  FFComputer<_I,_O> fc4( svm, xi, range4, fvals );
+  boost::thread t1(fc1);
+  boost::thread t2(fc2);
+  boost::thread t3(fc3);
+  boost::thread t4(fc4);
+
+  // Wait for the threads to finish
+  t1.join(); t2.join(); t3.join(); t4.join();
+
+  // Find the largest violation
+  unsigned int viol_argmax = 0;
+  double viol_max = -1.0 * std::numeric_limits<double>::infinity();
+  double slack_max = -1.0 * std::numeric_limits<double>::infinity();
+  double self_f = 0.0;
+
+  // Loop over the possible labels
+  svec_t alpha = svm.getAlpha( xi );
+  for( unsigned int yj = 0; yj < no; yj++ )
+    {
+      // Compute the loss + w^T * \psi(xi, yj) term
+      double loss = pds->oloss( yi, yj );
+      //      double dotp = this->f( xi, yj );
+      double dotp = fvals[yj];
+      double sum = loss + dotp;
+
+      // Check for self
+      if( yj == yi ) self_f = dotp;
+
+      // Compare with the largest violation
+      if( sum > viol_max )
+	{
+	  viol_max = sum;
+	  viol_argmax = yj;
+	}
+
+      if( alpha.find( yj ) != alpha.end() )
+	{
+	  // Compare to the largest slack
+	  if( sum > slack_max ) slack_max = sum;
+	}
+    }
+
+  // Early check
+  if( viol_max <= (slack_max + epsilon) ) return -1;
+
+  // Adjust the slack and the violation
+  viol_max -= self_f;
+  slack_max -= self_f;
+  if( slack_max < 0 ) slack_max = 0;
+
+  // Compare and return
+  if( viol_max > (slack_max + epsilon) ) return viol_argmax;
+  else return -1;
+}
+
+template< typename _I, typename _O, char _R >
+CnsSSVM<_I, _O, _R>::CnsSSVM( const SSSVMParams& pp )
+  : CClassifier<_I,_O>( "nsSSVM" + string(1,_R) ),
+    params( pp ) { oracle = makeDefaultOracle( _SResc<_R>() ); }
+
+template< typename _I, typename _O, char _R >
+void CnsSSVM<_I, _O, _R>::train()
+{
+  const unsigned int n = this->pdsTrain->sizeI();
+
+  // Prepare the alpha vector
+  alpha.resize( n );
+  asum.resize( n );
+  yLast.resize( n );
+  Jcache.resize( n );
+
+  // Report the value
+  string msg = "Training on " + boost::lexical_cast<string>( n ) +
+    " samples using the value of Cn = " + boost::lexical_cast<string>( params.Cn );
+  this->displayMessage( msg );
+  this->displayMessage( "Prefix for saving model iterations: " + params.fnPrefix );
+
+  // Attempt to preload any precomputed models
+  int curIter = -1;
+  if( params.fnPrefix.empty() == false )
+    {
+      curIter = preload( this->pdsTrain );
+      cout<<"Preloaded iteration "<<curIter<<endl;
+    }
+
+  const int maxIter = 100;
+
+  do
+    {
+      unsigned int nNew = 0;
+      for( unsigned int xi = 0; xi < n; xi++ )
+	{ 
+	  // Display progress
+	  if( xi % 100 == 0 )
+	    { std::cout<<"."; std::cout.flush(); }
+
+	  // Find the most violated constraint
+	  int yhat = oracle( xi );
+	  if( yhat < 0 ) continue;
+
+	  // Add constraint to the working set
+	  alpha[xi][yhat] = 0.0;
+	  yLast[xi].push_back( yhat );
+	  ++nNew;
+
+	  // Perform subspace ascent
+	  SVMopt( _SResc<_R>(), xi, params.Cn );
+	}
+      std::cout<<"  "<<nNew<<" new constraints added"<<std::endl;
+      if( nNew == 0 ) break;
+
+      //      double dobj; obj( _SResc<_R>(), dobj );
+      //      cout<<"Objective values: "<<pobj<<", "<<dobj<<endl;
+
+      if( ++curIter >= maxIter ) break;
+
+      // Save the current model iteration
+      if( params.fnPrefix.empty() == false )
+	{
+	  string fn = params.fnPrefix + "_iter" + boost::lexical_cast<string>( curIter ) + ".gz";
+	  save( fn );
+	}
+    }
+  while( 1 );
+}
+
+template< typename _I, typename _O, char _R >
+double CnsSSVM<_I,_O,_R>::J( unsigned int xi, unsigned int y, unsigned int xj, unsigned int ybar ) const
+{
+  // Locate all the quantities
+  unsigned int yi = this->pdsTrain->map( xi );
+  unsigned int yj = this->pdsTrain->map( xj );
+
+  // Compute the kernel values
+  double K1 = this->pdsTrain->iokernel( xi, yi, xj, yj );
+  double K2 = this->pdsTrain->iokernel( xi, y, xj, yj );
+  double K3 = this->pdsTrain->iokernel( xi, yi, xj, ybar );
+  double K4 = this->pdsTrain->iokernel( xi, y, xj, ybar );
+
+  return (K1 - K2 - K3 + K4);
+}
+
+template< typename _I, typename _O, char _R >
+double CnsSSVM<_I,_O,_R>::JdotAlpha( unsigned int k, unsigned int i ) const
+{
+  double res = 0.0;
+  for( unsigned int kk = 0; kk < alpha.size(); kk++ )	// This is fine because empty alpha[kk] make no contribution
+    {
+      for( svec_t::const_iterator iter = alpha[kk].begin(); iter != alpha[kk].end(); iter++ )
+	res += iter->second * J( k, i, kk, iter->first );
+    }
+
+  return res;
+}
+
+template< typename _I, typename _O, char _R >
+double CnsSSVM<_I,_O,_R>::alphaJAlpha() const
+{
+  double res = 0.0;
+
+  // Compute the upper-right off-diagonal entries
+  for( unsigned int kk = 0; kk < this->alpha.size(); kk++ )
+    for( unsigned int ll = kk+1; ll < this->alpha.size(); ll++ )
+      for( svec_t::const_iterator iter_k = this->alpha[kk].begin(); iter_k != this->alpha[kk].end(); iter_k++ )
+	for( svec_t::const_iterator iter_l = this->alpha[ll].begin(); iter_l != this->alpha[ll].end(); iter_l++ )
+	  res += iter_k->second * iter_l->second * 
+	    J( kk, iter_k->first, ll, iter_l->first );
+
+  res *= 2;
+
+  // Compute the diagonal entries
+  for( unsigned int ii = 0; ii < this->alpha.size(); ii++ )
+    for( svec_t::const_iterator iter_k = this->alpha[ii].begin(); iter_k != this->alpha[ii].end(); iter_k++ )
+      for( svec_t::const_iterator iter_l = this->alpha[ii].begin(); iter_l != this->alpha[ii].end(); iter_l++ )
+	res += iter_k->second * iter_l->second * 
+	  J( ii, iter_k->first, ii, iter_l->first );
+
+  return res;
+}
+
+template< typename _I, typename _O, char _R >
+void CnsSSVM<_I,_O,_R>::updateAlphaSum( unsigned int k )
+{
+  asum[k] = 0.0;
+  for( svec_t::iterator iter = alpha[k].begin(); iter != alpha[k].end(); ++iter )
+    asum[k] += iter->second;
+}
+
+template< typename _I, typename _O, char _R >
+double CnsSSVM<_I,_O,_R>::f( pair< const CDataSet<_I>&, unsigned int > x, unsigned int dso ) const
+{
+  const unsigned int n = this->pdsTrain->sizeI();
+  double res = 0.0;
+
+  // Traverse the sparse vectors of alphas
+  for( unsigned int xk = 0; xk < n; ++xk )
+    {
+      // Retrieve the sample associated with this specific entry
+      unsigned int yk = this->pdsTrain->map( xk );
+
+      // Precompute the input space kernel
+      double xker = this->pdsTrain->ikernel( xk, x );
+
+      // Compute the first kernel value
+      double yker1 = this->pdsTrain->okernel( yk, dso );
+      double K1 = this->pdsTrain->iokernel( xker, yker1 );
+
+      // Add the positive contribution
+      res += K1 * asum[xk];
+
+      for( svec_t::const_iterator iter = alpha[xk].begin(); iter != alpha[xk].end(); ++iter )
+	{
+	  // Skip non-SVs
+	  if( iter->second == 0 ) continue;
+
+	  // Retrieve the associated ybar
+	  unsigned int ybark = iter->first;
+	  
+	  // Compute the second kernel value
+	  double yker2 = this->pdsTrain->okernel( ybark, dso );
+	  double K2 = this->pdsTrain->iokernel( xker, yker2 );
+
+	  // Add the negative contribution
+	  res -= iter->second * K2;
+	}
+    }
+
+  return res;
+}
+
+template< typename _I, typename _O, char _R >
+void CnsSSVM<_I,_O,_R>::save( const string& filename ) const
+{
+  // Open a file in gzip format
+  boost::iostreams::filtering_ostream ofs;
+  openWriteFile( filename, ofs );
+  cout<<"Saving the current model to "<<filename<<endl;
+
+  // Display some statistics about the dataset
+  ofs<<this->pdsTrain->sizeI()<<" "<<this->pdsTrain->sizeO()<<endl;
+
+  // Output alpha
+  for( unsigned int i = 0; i < alpha.size(); ++i )
+    {
+      for( svec_t::const_iterator iter = alpha[i].begin(); iter != alpha[i].end(); ++iter )
+	ofs<<iter->first<<" "<<iter->second<<" ";
+      ofs<<endl;
+    }
+
+  // Output yLast
+  for( unsigned int i = 0; i < yLast.size(); ++i )
+    {
+      for( unsigned int j = 0; j < yLast[i].size(); ++j )
+	ofs<<yLast[i][j]<<" ";
+      ofs<<endl;
+    }
+
+  ofs<<"end"<<endl;
+  boost::iostreams::close( ofs );
+}
+
+template< typename _I, typename _O, char _R >
+bool CnsSSVM<_I,_O,_R>::load( shared_ptr< const CIODataSet<_I, _O> > pds, const string& filename )
+{
+  using spirit::parse;
+  using spirit::uint_p;
+  using spirit::real_p;
+  using spirit::blank_p;
+  using spirit::assign_a;
+  using spirit::push_back_a;
+
+  this->pdsTrain = pds;
+
+  // Open the gzipped file
+  string s;
+  boost::iostreams::filtering_istream ifs;
+  if( openReadFile( filename, ifs ) == false ) return false;
+  if( ifs.fail() ) return false;
+  
+  // Retrieve the statistics about the data
+  std::getline( ifs, s );
+  if( ifs.fail() ) return false;
+  unsigned int ni, no;
+  if( parse( s.c_str(),
+	     ( uint_p[assign_a(ni)] >> *blank_p >>
+	       uint_p[assign_a(no)] >> *blank_p )).full == false )
+    throw std::runtime_error( "Failed to parse data statistics" );
+
+  // Match the statistics against the associated dataset
+  if( pds->sizeI() != ni || pds->sizeO() != no )
+    throw std::logic_error( "The number of examples in the file does not match the associated data" );
+
+  vector< svec_t > a( ni );
+  vector< vector< unsigned int > > yl( ni );
+
+  // Parse alphas
+  for( unsigned int i = 0; i < ni; ++i )
+    {
+      // Retrieve the next line
+      std::getline( ifs, s );
+      if( ifs.fail() ) return false;
+
+      // Parse the values
+      vector< unsigned int > keys;
+      vector< double > vals;
+      if( parse( s.c_str(),
+		 *( uint_p[push_back_a(keys)] >> *blank_p >>
+		    real_p[push_back_a(vals)] >> *blank_p ) ).full == false )
+	throw std::runtime_error( "Failed to parse alpha" );
+
+      // Add the values
+      for( unsigned int j = 0; j < keys.size(); j++ )
+	a[i][keys[j]] = vals[j];
+    }
+
+  // Parse yLast
+  for( unsigned int i = 0; i < ni; ++i )
+    {
+      // Retrieve the line
+      std::getline( ifs, s );
+      if( ifs.fail() ) return false;
+
+      // Parse the values
+      if( parse( s.c_str(),
+		 *( uint_p[push_back_a(yl[i])] >> *blank_p ) ).full == false )
+	throw std::runtime_error( "Failed to parse yLast" );
+    }
+
+  // Parse the final line
+  std::getline( ifs, s );
+  if( ifs.fail() ) return false;
+  if( s != "end" ) return false;
+
+  boost::iostreams::close( ifs );
+
+  // Setup the data structures
+  alpha.swap( a );
+  yLast.swap( yl );
+
+  // Recompute the cache and update alpha sums
+  asum.resize( ni );
+  Jcache.resize( ni );
+  for( unsigned int k = 0; k < ni; ++k )
+    {
+      updateAlphaSum( k );
+      const unsigned int n = yLast[k].size();
+      Jcache[k].resize( n*n );
+      for( unsigned int i = 0; i < n; ++i )
+	for( unsigned int j = 0; j < n; ++j )
+	  Jcache[k][i*n+j] = J( k, yLast[k][i], k, yLast[k][j] );
+    }
+
+  return true;
+}
+
+template< typename _I, typename _O, char _R >
+int CnsSSVM<_I,_O,_R>::preload( shared_ptr< const CIODataSet<_I, _O> > pds )
+{
+  // Find the latest file
+  int iLatest = -1;
+  while( true )
+    {
+      string fname = params.fnPrefix + "_iter" + boost::lexical_cast<string>( iLatest+1 ) + ".gz";
+      std::ifstream ifs( fname.c_str() );
+      if( ifs.fail() == true ) break;
+      else iLatest++;
+    }
+  cout<<"Latest available iteration is "<<iLatest<<endl;
+
+  // Attempt to load the precomputed stuff
+  for( int i = iLatest; i >= 0; --i )
+    {
+      string fname = params.fnPrefix + "_iter" + boost::lexical_cast<string>( i ) + ".gz";
+      bool b = load( pds, fname );
+      if( b == true ) return i;
+    }
+
+  return -1;
+}
+
+///////////////////////////// Margin re-scaling /////////////////////////////
+
+template< typename _I, typename _O, char _R >
+void CnsSSVM<_I,_O,_R>::SVMopt( _SResc<'m'>, unsigned int k, double Cn )
+{
+  if( this->alpha[k].size() != this->yLast[k].size() )
+    throw std::logic_error( "Inconsistent weight vector sizes" );
+
+  // Do nothing if there are no coefficients
+  if( this->alpha[k].size() == 0 ) return;
+
+  unsigned int yk = this->pdsTrain->map( k );
+
+  // Compute the J matrix entries
+  const unsigned int n = this->yLast[k].size();
+  this->Jcache[k].resize( n*n );
+  for( unsigned int i = n-1;; i-- )
+    {
+      for( unsigned int j = n-1;; j-- )
+	{
+	  // Copy over the old entries
+	  if( i < (n-1) && j < (n-1) )
+	    this->Jcache[k][i*n+j] = this->Jcache[k][i*(n-1)+j];
+
+	  // Compute the new entries
+	  else
+	    this->Jcache[k][i*n+j] = this->J( k, this->yLast[k][i], k, this->yLast[k][j] );
+
+	  if( j == 0 ) break;
+	}
+      if( i == 0 ) break;
+    }  
+
+  // Compute the constant factor
+  vector< double > delta( n );
+  for( unsigned int i = 0; i < n; i++ )
+    delta[i] = this->pdsTrain->oloss( yk, this->yLast[k][i] );
+
+  for( unsigned int i = 0; i < n; i++ )
+    {
+      for( unsigned int kk = 0; kk < this->alpha.size(); kk++ )
+	{
+	  if( kk == k ) continue;
+	  for( svec_t::const_iterator iter_j = this->alpha[kk].begin(); iter_j != this->alpha[kk].end(); iter_j++ )
+	    delta[i] -= iter_j->second * this->J( k, this->yLast[k][i], kk, iter_j->first );
+	}
+    }
+
+  vector<double> x = strongQuadraticOpt( this->Jcache[k], delta, Cn );
+
+  for( unsigned int i = 0; i < n; i++ )
+    this->alpha[k][ this->yLast[k][i] ] = x[i];
+
+  // Update the cached sum value
+  updateAlphaSum( k );
+}
+
+template< typename _I, typename _O, char _R >
+double CnsSSVM<_I,_O,_R>::obj( _SResc<'m'> _sresc, double& dual ) const
+{
+  unsigned int n = this->alpha.size();	// The number of samples
+
+  // Compute the second norm of w
+  double w2 = this->alphaJAlpha();
+
+  // Compute the slack component
+  double xi_sum = 0.0;
+  for( unsigned int kk = 0; kk < n; kk++ )
+    xi_sum += compSlackAll( _sresc, kk );
+
+  // Compute the loss contribution
+  double loss_contr = 0.0;
+  for( unsigned int xk = 0; xk < n; xk++ )
+    {
+      unsigned int yk = this->pdsTrain->map( xk );
+      for( svec_t::const_iterator iteri = this->alpha[xk].begin(); iteri != this->alpha[xk].end(); iteri++ )
+	loss_contr += iteri->second * this->pdsTrain->oloss( yk, iteri->first );
+    }
+
+  // Compute the primal objective value
+  std::cout<<0.5 * w2<<" + "<<CnsSSVM<_I,_O,'m'>::params.Cn * xi_sum<<" = ";
+  double objval = 0.5 * w2 + CnsSSVM<_I,_O,'m'>::params.Cn * xi_sum;
+  std::cout<<objval<<", ";
+
+  // Compute the dual objective value
+  std::cout<<-0.5 * w2<<" + "<<loss_contr<<" = ";
+  dual = -0.5 * w2 + loss_contr;
+  std::cout<<dual;
+
+  // Compute the gap
+  std::cout<<", gap = "<<(objval - dual);
+
+  return objval;
+}
+
+template< typename _I, typename _O, char _R >
+double CnsSSVM<_I, _O, _R>::compSlackAll( _SResc<'m'>, unsigned int xi ) const
+{
+  unsigned int yi = this->pdsTrain->map( xi );
+  double res = -1.0 * std::numeric_limits<double>::infinity();
+
+  // Loop over all labels
+  for( unsigned int yj = 0; yj < this->pdsTrain->getO()->size(); yj++ )
+    {
+      // Compute the loss + w^T \psi( x_i, y_j ) term
+      double loss = this->pdsTrain->oloss( yi, yj );
+      double dotp = this->CClassifier<_I,_O>::f( xi, yj );
+      double sum = loss + dotp;
+
+      if( sum > res ) res = sum;
+    }
+
+  res -= this->CClassifier<_I,_O>::f( xi, yi );
+  if( res < 0.0 ) return 0.0;
+  return res;
+}
+
+#endif

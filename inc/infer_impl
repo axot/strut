@@ -1,0 +1,89 @@
+/// -*-c++-*-
+/// \file infer_impl
+/// \brief Implementation of inference algorithms
+/// \author Artem Sokolov
+
+#ifndef INFER_IMPL__INCLUDED
+#define INFER_IMPL__INCLUDED
+
+template< typename _I, typename _O >
+unsigned int FLoopyArgmax<_I,_O>::operator()( pair< const CDataSet<_I>&, unsigned int > smpl )
+{
+  // Retrieve the number of output-space samples to traverse
+  shared_ptr< const CIODataSet<_I, _O> > pds = clsf.getDataSet();
+  unsigned int n = pds->sizeO();
+
+  // Setup the max and argmax variables
+  unsigned int amax = 0;
+  double max = clsf.f( smpl, 0 );
+
+  for( unsigned int i = 1; i < n; ++i )
+    {
+      // Compute the compatibility function value
+      double f_val = clsf.f( smpl, i );
+
+      // Compare to best-so-far
+      if( f_val > max )
+	{
+	  // Specify the new best
+	  amax = i;
+	  max = f_val;
+	}
+    }
+
+  return amax;
+}
+
+template< typename _I, typename _O >
+unsigned int FBLASTArgmax<_I,_O>::operator()( pair< const CDataSet<_I>&, unsigned int > smpl )
+{
+  // Find the neighbor
+  string name = clsf.findName( smpl );
+  int xpred = clsf.findBLASTNeighbor( name );
+  if( xpred < 0 ) xpred = clsf.findKernelNeighbor( smpl );
+  if( xpred < 0 ) throw std::runtime_error( "Failed to find a neighbor" );
+
+  // Fetch the associated label
+  shared_ptr< CIODataSet<_I, _O> const > pds = clsf.getDataSet();
+  return pds->map( xpred );
+}
+
+template< typename _I, char _R >
+unsigned int SGOArgmax<_I,_R>::operator()( pair< const CDataSet<_I>&, unsigned int > smpl )
+{
+  // Assumptions
+  // 1. Product joint kernel
+  // 2. Linear output-space kernel
+  
+  // Retrieve the relevant data structures
+  shared_ptr< const CIODataSet<_I,CSparseSample> > pds = svm.getDataSet();
+  shared_ptr< const CDataSet<CSparseSample> > pO = pds->getO();
+  shared_ptr< const CFeatMap > pfm = pO->getSample(0)->getFeatMap();
+  unsigned int ni = pds->sizeI();
+
+  // Find the output-space representation of the weight vector w
+  // w(x) = \for_{i=1}^n \for_{z \in Y} \alpha_{i,z} KX( x, xi ) z
+
+  // Traverse the training examples
+  for( unsigned int xi = 0; xi < ni; ++xi )
+    {
+      // Fetch the support vectors
+      svec_t alpha = svm.getAlpha(xi);
+      
+      // Compute the input space term
+      double KX = ikernel( xi, smpl );
+
+      for( svec_t::iterator iter = alpha.begin(); iter != alpha.end(); ++iter )
+	{
+	  double val = iter->second * KX;
+
+	  // Retrieve the associated label
+	  unsigned int zi = iter->first;
+	  shared_ptr< CSparseSample const > z = pO->getSample( zi );
+	}
+    }
+
+  return 0;
+}
+
+#endif

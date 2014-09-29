@@ -1,0 +1,22 @@
+#! /bin/tcsh -f
+
+cat Makefile.header
+
+set hfiles = `ls inc/*.h`
+foreach hf ($hfiles)
+    set deps = `grep "#include" $hf | grep -v "<" | sed s/\#include\ // | sed s:\":inc/: | sed s:\"::`
+    if ($#deps > 0) then
+	echo $hf : $deps
+	printf "\ttouch $hf"
+	echo ""
+    endif
+end
+
+set cfiles = `ls src/*.cpp`
+foreach cf ($cfiles)
+    set of = `echo $cf | sed s/.cpp/.o/ | sed s/src/obj/`
+    set deps = `grep "#include" $cf | grep -v "<" | sed s/\#include\ // | sed s:\":inc/: | sed s:\"::`
+    echo $of : $cf $deps
+    printf '\tg++ $(CPPFLAGS) -c -o $@ $<'
+    echo ""
+end

@@ -1,0 +1,207 @@
+// -*-c++-*-
+/// \file io-dataset_impl
+/// \brief templated implementation of CIODataSet
+/// \author Artem Sokolov
+
+#ifndef IO_DATASET_IMPL__INCLUDED
+#define IO_DATASET_IMPL__INCLUDED
+
+using std::cout;
+using std::endl;
+
+// Constructor
+template< typename _I, typename _O >
+CIODataSet<_I, _O>::CIODataSet( const function< double( const _I&, const _I& ) >& fkeri,
+				const function< double( const _O&, const _O& ) >& fkero,
+				const function< double( const _O&, const _O& ) >& floss,
+				const function< double( double, double ) >& f_ioker )
+  : pids( new CDataSet<_I>( fkeri ) ),
+    pods( new CDataSet<_O>( fkero, floss ) ),
+    fioker( f_ioker )
+{
+}
+
+// Constructor
+template< typename _I, typename _O > 
+CIODataSet<_I, _O>::CIODataSet( shared_ptr< CDataSet<_I> > pi,
+				shared_ptr< CDataSet<_O> > po,
+				const vector< unsigned int >& io_map,
+				const function< double( double, double ) >& f_ioker )
+  : pids( pi ),
+    pods( po ),
+    iomap( io_map ),
+    fioker( f_ioker )
+{
+  if( pi->size() != io_map.size() ) throw std::logic_error( "CIODataSet construction: inconsistent argument sizes" );
+}
+
+// Constructor
+template< typename _I, typename _O >
+CIODataSet<_I, _O>::CIODataSet( const function< double( const _I&, const _I& ) >& fkeri,
+				shared_ptr< CDataSet<_O> > po,
+				const function< double( double, double ) >& f_ioker )
+  : pids( new CDataSet<_I>( fkeri ) ),
+    pods( po ),
+    fioker( f_ioker )
+{  
+}
+
+// Copy constructor
+template< typename _I, typename _O >
+CIODataSet<_I, _O>::CIODataSet( const CIODataSet& other )
+  : pids( new CDataSet<_I>( *(other.pids) ) ),	// Deep copy the input space
+    pods( new CDataSet<_O>( *(other.pods) ) ),	// Deep copy the output space
+    iomap( other.iomap ),
+    fioker( other.fioker )
+{
+}
+
+/// Splits the dataset into training and test subsets
+template< typename _I, typename _O >
+void CIODataSet<_I, _O>::splitTrainTest( virange_t vTrain, virange_t vTest,
+					 shared_ptr< CIODataSet<_I, _O> >& pTrain,
+					 shared_ptr< CIODataSet<_I, _O> >& pTest ) const
+{
+  // Retrieve the kernels
+  typename CDataSet<_I>::binop_t fkeri = pids->getKernel();
+  typename CDataSet<_O>::binop_t fkero = pods->getKernel();
+  typename CDataSet<_O>::binop_t floss = pods->getLoss();
+
+  // Create the datasets
+  pTrain.reset( new CIODataSet<_I, _O>(fkeri, fkero, floss, fioker) );
+  pTest.reset( new CIODataSet<_I, _O>(fkeri, fkero, floss, fioker) );
+
+  // Transfer the output space pointer
+  pTrain->pods = this->pods;
+  pTest->pods = this->pods;
+
+  // Traverse the training sets of indices
+  for( unsigned int i = 0; i < vTrain.size(); i++ )
+    for( unsigned int j = vTrain[i].first; j < vTrain[i].second; j++ )
+      {
+	pTrain->pids->addSample( this->pids, j );
+	pTrain->iomap.push_back( this->iomap[j] );
+      }
+  
+  // Traverse the test sets of indices
+  for( unsigned int i = 0; i < vTest.size(); i++ )
+    for( unsigned int j = vTest[i].first; j < vTest[i].second; j++ )
+      {
+	pTest->pids->addSample( this->pids, j );
+	pTest->iomap.push_back( this->iomap[j] );
+      }
+}
+
+// Recaches the kernel matrices
+template< typename _I, typename _O >
+void CIODataSet<_I,_O>::cache()
+{
+  pids->cache();
+  pods->cache();
+}
+
+// Randomly shuffles the examples
+template< typename _I, typename _O >
+void CIODataSet<_I,_O>::random_shuffle()
+{
+  const unsigned int n = pids->size();
+  vector< unsigned int > v( n );
+  for( unsigned int i = 0; i < n; i++ ) v[i] = i;
+  std::random_shuffle( v.begin(), v.end() );    
+  subsample( v );
+}
+
+// Subsamples the dataset
+template< typename _I, typename _O >
+void CIODataSet<_I, _O >::subsample( const vector<unsigned int>& indices )
+{
+  vector< unsigned int > new_iomap;
+  vector< int > new_foldsizes;
+
+  // Subsample the input-space dataset
+  pids->subsample( indices );
+
+  // Subsample the map and the fold sizes
+  //  new_foldsizes.resize( fold_sizes.size() );
+  for( vector<unsigned int>::const_iterator iter = indices.begin();
+       iter != indices.end(); iter++ )
+    {
+      // Update the map
+      new_iomap.push_back( iomap[*iter] );
+    }
+
+  iomap.swap( new_iomap );
+}
+
+// Matches up the pattern IDs between i and o and stores the matches internally
+// Returns the number of samples added
+template< typename _I, typename _O >
+unsigned int CIODataSet<_I,_O>::addSets( const CDataSet<_I>& i_ds,
+					 const CDataSet<_O>& o_ds )
+{
+  unsigned int n_old = pids->size();
+   
+  // Traverse the patterns of the input set
+  for( unsigned int i = 0; i < i_ds.size(); i++ )
+    {
+      // Retrieve the pattern ID of the i^th pattern 
+      std::string sid = i_ds.i2s( i );
+ 
+      // Find the pattern ID in the output set
+      int j = o_ds.s2i( sid );
+   
+      if( j >= 0 )
+   	{
+	  // Fetch the samples and add them to the dataset
+	  shared_ptr< _I const > psi = i_ds.getSample( i );
+	  shared_ptr< _O const > pso = o_ds.getSample( j );
+	  addSample( sid, psi, pso );
+   	}
+    }
+   
+  unsigned int n = pids->size() - n_old;
+  return n;
+}
+
+/// Add an input-output sample pairing
+template< typename _I, typename _O >
+void CIODataSet<_I,_O>::addSample( const string& name,
+				   shared_ptr<_I const> pISample,
+				   shared_ptr<_O const> pOSample )
+{
+  // Add the output-space part
+  int jA = addOutputSample( name, pOSample );
+
+  // Add the sample to the dataset
+  addInputSample( name, pISample, jA );
+}
+
+// Adds an input-space sample to the dataset
+template< typename _I, typename _O >
+void CIODataSet<_I,_O>::addInputSample( const string& name, shared_ptr< _I const > pSample, unsigned int mapping )
+{
+  // Retrieve the sample id and verify the lack of sample existence
+  if( pids->s2i( name ) >= 0 )
+    throw std::logic_error( "Sample " + name + " already exists in the dataset" );
+
+  // Add the sample
+  pids->addSampleConst( name, pSample );
+  iomap.push_back( mapping );
+}
+
+/// Adds a sample to the output space, maintaining uniqueness
+template< typename _I, typename _O >
+int CIODataSet<_I,_O>::addOutputSample( const string& name, shared_ptr<_O const> pOSample )
+{
+  // Find the output sample in the output space
+  int jA = pods->findSample( pOSample );
+  if( jA < 0 )
+    {
+      pods->addSampleConst( name, pOSample );
+      jA = pods->findSample( pOSample );
+      if( jA < 0 ) throw std::logic_error( "Failed to find a sample after adding it. Name collision possible." );
+    }
+  return jA;
+}
+
+#endif

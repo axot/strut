@@ -1,0 +1,180 @@
+// -*-c++-*-
+/// \file blast-wrap_impl
+/// \brief Templated implementation of CBLASTClsfWrap
+
+#ifndef BLAST_WRAP_IMPL__INCLUDED
+#define BLAST_WRAP_IMPL__INCLUDED
+
+void addCombo( const vector< string >& combo, vector< vector< string > >& res, const GO::CGOContainer& goGraph )
+{
+  std::set< std::string > fullPath;
+
+  goGraph.getFullPaths( combo, fullPath );
+
+  std::vector< std::string > entry;
+  for( std::set< std::string >::const_iterator iter = fullPath.begin(); iter != fullPath.end(); iter++ )
+    entry.push_back( *iter );
+
+  res.push_back( entry );
+}
+// Recombines the BLAST outputs
+template< typename _I, typename _O >
+void CBLASTOSG<_I, _O>::recombineOutputs( const std::set<unsigned int>& po )
+{
+  shared_ptr< CDataSet<_O> const > pods = this->pds->getO();
+  shared_ptr< CFeatMap const > pfmap = pods->getSample(0)->getFeatMap();
+
+  // Compose the set of all annotated nodes
+  std::set< std::string > annoted_nodes;
+
+  for( std::set<unsigned int>::const_iterator iter = po.begin();
+       iter != po.end(); iter++ )
+    {
+      // Tag the annotated nodes
+      for( unsigned int j = 0; j < pfmap->nFeats(); j++ )
+	{
+	  if( pods->getSample(*iter)->getValue( j ) != 0.0 )
+	    annoted_nodes.insert( pfmap->i2f( j ) );
+	}
+    }
+
+  // Determine the parent-child relationship of the annotated nodes
+  std::set< std::string > parents;
+  for( std::set< std::string >::const_iterator iter = annoted_nodes.begin();
+       iter != annoted_nodes.end(); iter++ )
+    {
+      // Retrieve the node's parents
+      std::vector<std::string> p;
+      goGraph.getParents( *iter, p );
+      
+      // Empty p = the node is the root
+      if( p.size() < 1 ) parents.insert( *iter );
+      else
+	{
+	  for( unsigned int i = 0; i < p.size(); i++ )
+	    parents.insert( p[i] );
+	}
+    }
+
+  // Eliminate all but the lowest of the annotated nodes
+  std::set< std::string > lowest_nodes;
+  std::set_difference(annoted_nodes.begin(), annoted_nodes.end(), parents.begin(), parents.end(),
+		      std::inserter(lowest_nodes, lowest_nodes.begin()));
+
+  // Re-write as a vector for easy access;
+  std::vector< std::string > v_lowest_nodes;
+  for( std::set< std::string >::const_iterator iter = lowest_nodes.begin();
+       iter != lowest_nodes.end(); iter++ )
+    v_lowest_nodes.push_back( *iter );
+
+  // Compose all possible 1-, 2-, and 3- combinations of these nodes
+  std::vector< std::vector< std::string > > combos;
+  
+  // 1-
+  std::vector< std::string > combo; combo.resize(1);
+  for( unsigned int i = 0; i < v_lowest_nodes.size(); i++ )
+    {
+      combo[0] = v_lowest_nodes[i];
+      addCombo( combo, combos, goGraph );
+    }
+
+  // 2-
+  combo.resize(2);
+  for( unsigned int i = 0; i < v_lowest_nodes.size(); i++ )
+    {
+      combo[0] = v_lowest_nodes[i];
+      for( unsigned int j = i+1; j < v_lowest_nodes.size(); j++ )
+	{
+	  combo[1] = v_lowest_nodes[j];
+	  addCombo( combo, combos, goGraph );
+	}
+    }
+
+  // 3-
+  combo.resize(3);
+  for( unsigned int i = 0; i < v_lowest_nodes.size(); i++ )
+    {
+      combo[0] = v_lowest_nodes[i];
+      for( unsigned int j = i+1; j < v_lowest_nodes.size(); j++ )
+	{
+	  combo[1] = v_lowest_nodes[j];
+	  for( unsigned int k = j+1; k < v_lowest_nodes.size(); k++ )
+	    {
+	      combo[2] = v_lowest_nodes[k];
+	      addCombo( combo, combos, goGraph );
+	    }
+	}
+    }
+
+  // Transform key patterns to indices
+  for( unsigned int i = 0; i < combos.size(); i++ )
+    {
+      // Construct a sample for each combo
+      shared_ptr< CSparseSample > s( new CSparseSample( pfmap ) );
+      for( unsigned int k = 0; k < combos[i].size(); k++ )
+	{
+	  int j = pfmap->f2i( combos[i][k] );
+	  if( j >= 0 )
+	    s->setValue( j, 1.0 );
+	}
+
+      // Search for the sample in the dataset
+      int j = pods->findSample( s );
+      if( j >= 0 ) add( j );
+    }
+}
+
+template< typename _I, typename _O >
+void CBLASTOSG<_I, _O>::generate( string sample_id )
+{
+  // If no BLAST information is available for this sample, use the full output space
+  GO::CBLASTOutput::emap_const_iter_t blast_iter = pbo->find( sample_id );
+  if( blast_iter == pbo->end() )
+    {
+      for( unsigned int i = 0; i < pds->getO()->size(); i++ ) add( i );
+      return;
+    }
+
+  // Determine a list of significant BLAST hits and sort them by e-value
+  std::vector< GO::CBLASTOutput::SBOEntry > blast_hits = blast_iter->second;
+  std::sort( blast_hits.begin(), blast_hits.end() );
+
+  // Compose a list of the corresponding output samples
+  std::set< unsigned int > potential_outputs;
+  for( unsigned int bhi = 0; bhi < blast_hits.size(); bhi++ )
+    {
+      // Make sure we haven't crossed the threshold for e-value yet
+      if( blast_hits[bhi].e_value > GO::e_val_threshold ) break;
+
+      // Retrieve the name, index and fold of the hit
+      std::string match_id = blast_hits[bhi].subject_id;
+
+      // Attempt to find the protein in the training set
+      int match_i = pds->s2i( match_id );
+      if( match_i < 0 ) continue;
+      
+      // Store the corresponding output index as a potential candidate
+      potential_outputs.insert( pds->map(match_i) );
+    }
+
+  // Recombine the inputs if necessary
+  if( recomb == true && potential_outputs.size() > 1 )
+    {
+      recombineOutputs( potential_outputs );
+      return;
+    }
+
+  if( potential_outputs.size() == 0 )
+    {
+      // Use a full set of indices
+      for( unsigned int i = 0; i < pds->getO()->size(); i++ )
+	add( i );
+      return;
+    }
+
+  // Store the set
+  for( std::set< unsigned int >::const_iterator iter = potential_outputs.begin();
+       iter != potential_outputs.end(); iter++ ) add( *iter );
+}
+
+#endif

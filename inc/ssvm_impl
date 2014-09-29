@@ -1,0 +1,554 @@
+// -*-c++-*-
+/// \file ssvm_impl
+/// \brief Templated implementation of C1sSSVM
+/// \author Artem Sokolov
+
+#ifndef SSVM_IMPL__INCLUDED
+#define SSVM_IMPL__INCLUDED
+
+#include <map>
+#include <boost/thread.hpp>
+
+using std::map;
+using std::pair;
+
+template< typename _I, typename _O >
+void C1sSSVM<_I,_O>::CViolSampleRange::operator() ()
+{
+  for( unsigned int i = xks; i < xke; i++ )
+    {
+      // Display progress
+      if( i % 100 == 0 )
+      	{ std::cout<<"."; std::cout.flush(); }
+
+      res[i] = svm.computeYHat( i );
+    }
+}
+
+///////////////////////////////////////////////////////////////////////
+
+template< typename _I, typename _O >
+C1sSSVM<_I,_O>::C1sSSVM( const SSSVMParams& pp )
+  : CClassifier<_I, _O>( "SSVM" ) 
+{
+  params = pp;
+}
+
+template< typename _I, typename _O >
+void C1sSSVM<_I,_O>::train()
+{
+  const unsigned int n = this->pdsTrain->sizeI();
+
+  // Clear any previous solution
+  alpha.clear();
+  ybar.clear();
+  Hmat.clear();
+
+  string msg = "Training on " + boost::lexical_cast<string>( n ) +
+    " samples using the value of Cn = " + boost::lexical_cast<string>( params.Cn );
+  this->displayMessage( msg );
+
+  unsigned int nIter = 0;
+  unsigned int maxIter = 100;
+
+  do
+    {
+      // Find the most violated set of labels
+      metalabel lbl = makeViolMetalabel();
+
+      // Add the constraint to the working set
+      ybar.push_back( lbl );
+      alpha.push_back( 0 );
+
+      // Optimize over the working set
+      this->displayMessage( "Running SVM optimizer..." );
+      SVMopt();
+
+      cout<<"Alpha: ";
+      std::copy( alpha.begin(), alpha.end(),
+		 std::ostream_iterator< double >( cout, " " ) );
+      cout<<endl;
+
+      cout<<"Grad :";
+      for( unsigned int k = 0; k < alpha.size(); k++ )
+	cout<<" "<<Delta( k ) - HdotAlpha( k );
+      cout<<endl;
+
+      std::cout<<"Computing the objective function value..."<<endl;
+      displayObj();
+
+      // Compute the violation with respect to the working set and overall violation
+      double vWS = violWS();
+      double vAll = violAll();
+      cout<<"Viol w.r.t WS: "<<vWS<<endl;
+      cout<<"Overall viol : "<<vAll<<endl;
+
+      if( vAll < vWS + params.eps ) break;
+      if( ++nIter > maxIter ) break;
+    }
+  while( 1 );
+
+  std::cout<<"Final solution has "<<alpha.size()<<" cofficients"<<std::endl;
+  std::cout<<"Final objective value"<<endl;
+  displayObj();
+}
+
+template< typename _I, typename _O >
+double C1sSSVM<_I,_O>::f( pair< const CDataSet<_I>&, unsigned int > x, unsigned int y ) const
+{
+  if( this->alpha.size() == 0 ) return 0.0;
+
+  double res = 0.0;
+  unsigned int n = this->pdsTrain->sizeI();
+  
+  // Traverse the individual entries of the metalabels
+  for( unsigned int k = 0; k < n; k++ )
+    {
+      // Retrieve the sample associated with this specific entry
+      unsigned int xk = k;
+      unsigned int yk = this->pdsTrain->map( xk );
+      
+      double K1 = this->pdsTrain->iokernel( xk, yk, x, y );
+
+      // Traverse the associate coefficients
+      for( unsigned int ll = 0; ll < alpha.size(); ll++ )
+	{
+	  // Skip non-SVs
+	  if( this->alpha[ll] == 0.0 ) continue;
+
+	  unsigned int ybark = ybar[ll][k];
+	  double K2 = this->pdsTrain->iokernel( xk, ybark, x, y );
+
+	  // Compute the loss value
+	  double LY = this->pdsTrain->oloss( yk, ybark );
+
+	  // Add the contribution
+	  res += alpha[ll] * f_contr( K1, K2, LY );
+	}
+    }
+
+  return (res / static_cast<double>(n));
+}
+
+template< typename _I, typename _O >
+double C1sSSVM<_I,_O>::violWS() const
+{
+  double max = 0.0;
+  unsigned int n = this->pdsTrain->sizeI();
+
+  // Pre-cache the dot products of w with (x_i, y_i) pairs
+  vector<double> dp1( n );
+  for( unsigned int ii = 0; ii < n; ii++ )
+    {
+      // Retrieve the true indices
+      unsigned int x_i = ii;
+      unsigned int y_i = this->pdsTrain->map( x_i );
+      
+      // Compute and store the dot product
+      dp1[ii] = CClassifier<_I,_O>::f( x_i, y_i );
+    }
+
+  for( unsigned int jj = 0; jj < ybar.size(); jj++ )
+    {
+      vector<double> xi_i( n );
+      for( unsigned int ii = 0; ii < n; ii++ )
+	{
+	  // Retrieve the true indices
+	  unsigned int x_i = ii;
+	  unsigned int y_i = this->pdsTrain->map( x_i );
+
+	  // Compute the loss and dot products
+	  double loss = this->pdsTrain->oloss( y_i, ybar[jj][ii] );
+	  double dp2 = CClassifier<_I,_O>::f( x_i, ybar[jj][ii] );
+	  double xival = (loss - dp1[ii] + dp2);
+	  xi_i[ii] = (xival > 0.0) ? xival : 0.0;
+	}
+
+      // Compute the sum
+      double sum = 0.0;
+      for( unsigned int ii = 0; ii < n; ii++ )
+	sum += xi_i[ii];
+
+      double val = sum / static_cast<double>(n);
+      if( val > max ) max = val;
+    }
+  return max;
+}
+
+template< typename _I, typename _O >
+double C1sSSVM<_I,_O>::violAll() const
+{
+  unsigned int n = this->pdsTrain->sizeI();
+
+  // Traverse the samples and compute xi_i
+  vector< double > xi_i( n );
+  for( unsigned int ii = 0; ii < n; ii++ )
+    {
+      // Retrieve the true indices
+      unsigned int x_i = ii;
+      unsigned int y_i = this->pdsTrain->map( x_i );
+      double max_i = -1.0 * std::numeric_limits<double>::infinity();
+
+      // Traverse all labels
+      for( unsigned int y_j = 0; y_j < this->pdsTrain->getO()->size(); y_j++ )
+	{
+	  // Compute the loss + w^T \psi( x_i, y_j ) term
+	  double loss = this->pdsTrain->oloss( y_i, y_j );
+	  double dotp = CClassifier<_I,_O>::f( x_i, y_j );
+	  double temp = dotp + loss;
+
+	  // Compare to the local best
+	  if( temp > max_i ) max_i = temp;
+	}
+
+      // Subtract the w^T \psi( x_i, y_i ) term
+      max_i -= CClassifier<_I,_O>::f( x_i, y_i );
+      if( max_i < 0.0 ) max_i = 0.0;
+      xi_i[ii] = max_i;
+    }
+
+  // Compute the average
+  double max = 0.0;
+  for( unsigned int ii = 0; ii < n; ii++ )
+    max += xi_i[ii];
+  max /= static_cast<double>( n );
+
+  return max;
+}
+
+template< typename _I, typename _O >
+typename C1sSSVM<_I,_O>::metalabel C1sSSVM<_I,_O>::makeRndMetalabel()
+{
+  // Declaration
+  metalabel lbl;
+
+  // Retrieve the sizes
+  unsigned int ntri = this->pdsTrain->size();
+  unsigned int no = this->pdsTrain->getO()->size();
+
+  // Populate the label
+  for( unsigned int i = 0; i < ntri; i++ )
+    {
+      // Generate a random sample from [0, no)
+      boost::uniform_int<> unif_range( 0, no );
+      boost::variate_generator< boost::mt19937&, boost::uniform_int<> > rng( g_RNG, unif_range );
+
+      lbl.push_back( rng() );
+    }
+
+  // Add the label and the associated coefficient to the members
+  return lbl;
+}
+
+template< typename _I, typename _O >
+typename C1sSSVM<_I,_O>::metalabel C1sSSVM<_I,_O>::makeViolMetalabel()
+{
+  // Split the range
+  const unsigned int n = this->pdsTrain->sizeI();
+  const unsigned int nThreads = 8;
+  const unsigned int nWhole = n / nThreads;
+  const unsigned int nRemain = n - nThreads * nWhole;
+
+  metalabel lbl( n );
+
+  // Create the threads
+  vector< shared_ptr< boost::thread > > myThreads;
+  unsigned int xks = 0;
+  for( unsigned int i = 0; i < nThreads; i++ )
+    {
+      // Compute the range
+      unsigned int xke = xks + nWhole;
+      if( i < nRemain ) xke++;
+
+      CViolSampleRange vsr( *this, xks, xke, lbl );
+      shared_ptr<boost::thread> pt( new boost::thread(vsr) );
+      myThreads.push_back( pt );
+
+      // Update the iterators
+      xks = xke;
+    }
+  
+  // Wait for the threads to finish
+  for( unsigned int i = 0; i < nThreads; i++ )
+    myThreads[i]->join();
+
+  //  for( unsigned int i = 0; i < n; i++ )
+  //    lbl[i] = computeYHat( i );
+
+  return lbl;
+}
+
+template< typename _I, typename _O >
+void C1sSSVM<_I,_O>::SVMopt()
+{
+  const unsigned int n = alpha.size();
+
+  // In case there's nothing to optimize
+  if( n == 0 ) return;
+
+  // Compose the quadratic term
+  vector< double > Q( n*n );
+  for( unsigned int i = 0; i < n; i++ )
+    for( unsigned int j = i; j < n; j++ )
+      Q[i*n+j] = H( i, j );
+
+  for( unsigned int i = 0; i < n; i++ )
+    for( unsigned int j = 0; j < i; j++ )
+      Q[i*n+j] = Q[j*n+i];
+
+  // Compute the linear term
+  vector< double > b( n );
+  for( unsigned int i = 0; i < n; i++ )
+    b[i] = Delta( i );
+
+  //  cout<<"Q: "; std::copy( Q.begin(), Q.end(), std::ostream_iterator<double>( cout, " " ) ); cout<<endl;
+  //  cout<<"b: "; std::copy( b.begin(), b.end(), std::ostream_iterator<double>( cout, " " ) ); cout<<endl;
+
+  // Run the optimizer
+  alpha = strongQuadraticOpt( Q, b, params.Cn );
+}
+
+template< typename _I, typename _O >
+double C1sSSVM<_I,_O>::Delta( unsigned int i ) const
+{
+  // Assumptions:
+  // 1. ybar[i].size() == pds->size() 
+  //    -- verified at ybar[i] creation
+
+  double res = 0.0;
+  unsigned int n = this->pdsTrain->sizeI(); 
+ 
+  // Iterate over the meta-label and compute the loss between each entry and the corresponding true label
+  for( unsigned int k = 0; k < n; k++ )
+    {
+      // Meta-label entry
+      unsigned int i1 = ybar[i][k];
+      
+      // True label
+      unsigned int xi = k;
+      unsigned int i2 = this->pdsTrain->map(xi);
+
+      // Add the loss contribution
+      res += this->pdsTrain->oloss( i1, i2 );
+    }
+
+  return (res / static_cast<double>(n));
+}
+
+template< typename _I, typename _O >
+double C1sSSVM<_I,_O>::HdotAlpha( unsigned int k ) const
+{
+  double res = 0.0;
+  for( unsigned int ii = 0; ii < alpha.size(); ii++ )
+    //    res += (alpha[ii] * Hmat[k][ii]);
+    res += (alpha[ii] * H( k, ii ));
+  return res;
+}
+
+template< typename _I, typename _O >
+void C1sSSVM<_I,_O>::displayObj() const
+{
+  // Compute the second norm of w
+  double w2 = 0.0;
+  for( unsigned int i = 0; i < alpha.size(); i++ )
+    w2 += alpha[i] * HdotAlpha( i );
+
+  // Compute the dual objective function value
+  double delta = 0.0;
+  for( unsigned int i = 0; i < alpha.size(); i++ )
+    delta += Delta(i) * alpha[i];
+  double dualobj = delta - 0.5 * w2;
+  cout<<delta<<" - "<<0.5*w2<<" = "<<dualobj<<endl;
+}
+
+template< typename _I, typename _O >
+void C1sSSVM<_I,_O>::cacheH()
+{
+  unsigned int n = alpha.size();
+
+  // The contents of the H matrix remains static, so only new entries need to be computed
+  unsigned int hsize = Hmat.size();
+  if( hsize == n ) return;	// No new entries
+
+  // Expand the matrix
+  Hmat.resize( n );
+
+  // Resize individual rows
+  for( unsigned int i = 0; i < n; i++ )
+    Hmat[i].resize(n);
+
+  // Compute one half of the matrix (the new entries)
+  for( unsigned int i = hsize; i < n; i++ )
+    for( unsigned int j = 0; j <= i; j++ )
+      Hmat[i][j] = H( i, j );
+
+  // Refect the matrix
+  for( unsigned int i = 0; i < n; i++ )
+    for( unsigned int j = (i+1); j < n; j++ )
+      Hmat[i][j] = Hmat[j][i];
+}
+
+///////////////////////////////////////////////////////////////////////////////////////
+
+template< typename _I, typename _O >
+double C1sSSVM_margin<_I,_O>::H( unsigned int i, unsigned int j ) const
+{
+  // Assumptions:
+  // 1. ybar[i].size() == pds->size()
+  // 2. ybar[j].size() == pds->size()
+  //    -- verified at creation of ybar[i], ybar[j]
+
+  double res = 0.0;
+  unsigned int n = this->pdsTrain->sizeI();
+  unsigned int xi, yi, xj, yj, ybari, ybarj;
+
+  // H( ybar, ybar' ) = 1/(n^2) * sum_{i,j} \left(
+  //      psi(x_i, y_i)^T psi(x_j, y_j)
+  //      - psi(x_i, y_i)^T psi(x_j, ybar'_j)
+  //      - psi(x_i, ybar_i)^T psi(x_j, y_j)
+  //      + psi(x_i, ybar_i)^T psi(x_j, ybar'_j)
+  // \right)
+  for( unsigned int ii = 0; ii < n; ii++ )
+    {
+      xi = ii;
+      yi = this->pdsTrain->map( xi );
+      ybari = this->ybar[i][ii];
+
+      for( unsigned int jj = 0; jj < n; jj++ )
+	{
+	  xj = jj;
+	  yj = this->pdsTrain->map( xj );
+	  ybarj = this->ybar[j][jj];
+
+	  // Compute K1 = psi(xi, yi)^T psi(xj, yj)
+	  double K1 = this->pdsTrain->iokernel( xi, yi, xj, yj );
+
+	  // Compute K2 = psi(xi, yi)^T psi(xj, ybar'j)
+	  double K2 = this->pdsTrain->iokernel( xi, yi, xj, ybarj );
+
+	  // Compute K3 = psi(xi, ybari)^T psi(xj, yj)
+	  double K3 = this->pdsTrain->iokernel( xi, ybari, xj, yj );
+
+	  // Compute K4 = psi(xi, ybari)^T psi(xj, ybar'j)
+	  double K4 = this->pdsTrain->iokernel( xi, ybari, xj, ybarj );
+
+	  // Add the contribution
+	  res += (K1 - K2 - K3 + K4);
+	}
+    }
+
+  return (res / (n*n));
+}
+
+template< typename _I, typename _O >
+unsigned int C1sSSVM_margin<_I,_O>::computeYHat( unsigned int xi ) const
+{
+  unsigned int yi = this->pdsTrain->map( xi );
+  unsigned int best_yj = 0;
+  double maxval = -1.0 * std::numeric_limits<double>::infinity();
+  const CDataSet<_I>& dsI = *this->pdsTrain->getI();
+
+  // Loop over the possible labels
+  for( unsigned int yj = 0; yj < this->pdsTrain->getO()->size(); yj++ )
+    {
+      // Compute the loss + w^\psi(.)
+      double loss = this->pdsTrain->oloss( yi, yj );
+      std::pair< const CDataSet<_I>&, unsigned int > smpl( dsI, xi );
+      double dotp = this->f( smpl, yj );
+      double sum = loss + dotp;
+
+      if( sum > maxval )
+	{
+	  maxval = sum;
+	  best_yj = yj;
+	}
+    }
+
+  return best_yj;
+}
+
+///////////////////////////////////////////////////////////////////////////////////////
+
+template< typename _I, typename _O >
+double C1sSSVM_slack<_I,_O>::H( unsigned int i, unsigned int j ) const
+{
+  // Assumptions:
+  // 1. ybar[i].size() == pds->size()
+  // 2. ybar[j].size() == pds->size()
+  //    -- verified at creation of ybar[i], ybar[j]
+
+  double res = 0.0;
+  unsigned int n = this->pdsTrain->sizeI();
+  unsigned int xi, yi, xj, yj, ybari, ybarj;
+
+  // H( ybar, ybar' ) = 1/(n^2) * sum_{i,j} \left(
+  //      psi(x_i, y_i)^T psi(x_j, y_j)
+  //      - psi(x_i, y_i)^T psi(x_j, ybar'_j)
+  //      - psi(x_i, ybar_i)^T psi(x_j, y_j)
+  //      + psi(x_i, ybar_i)^T psi(x_j, ybar'_j)
+  // \right)
+  for( unsigned int ii = 0; ii < n; ii++ )
+    for( unsigned int jj = 0; jj < n; jj++ )
+      {
+	xi = ii; xj = jj;
+	//	double KX = this->ikernel( xi, xj );
+
+	// Compute K1 = psi(xi, yi)^T psi(xj, yj)
+	yi = this->pdsTrain->map( xi );
+	yj = this->pdsTrain->map( xj );
+	double K1 = this->pdsTrain->iokernel( xi, yi, xj, yj );
+
+	// Compute K2 = psi(xi, yi)^T psi(xj, ybar'j)
+	ybarj = this->ybar[j][jj];
+	double K2 = this->pdsTrain->iokernel( xi, yi, xj, ybarj );
+
+	// Compute K3 = psi(xi, ybari)^T psi(xj, yj)
+	ybari = this->ybar[i][ii];
+	double K3 = this->pdsTrain->iokernel( xi, ybari, xj, yj );
+
+	// Compute K4 = psi(xi, ybari)^T psi(xj, ybar'j)
+	double K4 = this->pdsTrain->iokernel( xi, ybari, xj, ybarj );
+
+	// Compute L1 = loss( yi, ybari )
+	double L1 = this->pdsTrain->oloss( yi, ybari );
+
+	// Compute L2 = loss( yj, ybar'j )
+	double L2 = this->pdsTrain->oloss( yj, ybarj );
+
+	// Add the contribution
+	res += L1*L2*(K1 - K2 - K3 + K4);
+      }
+
+  return (res / (n*n));
+}
+
+template< typename _I, typename _O >
+unsigned int C1sSSVM_slack<_I,_O>::computeYHat( unsigned int xi ) const
+{
+  unsigned int yi = this->pdsTrain->map( xi );
+  unsigned int best_yj = 0;
+  double maxval = -1.0 * std::numeric_limits<double>::infinity();
+  const CDataSet<_I>& dsI = *this->pdsTrain->getI();
+
+  // Loop over the possible labels
+  for( unsigned int yj = 0; yj < this->pdsTrain->getO()->size(); yj++ )
+    {
+      // Compute the loss + w^\psi(.)
+      double loss = this->pdsTrain->oloss( yi, yj );
+      std::pair< const CDataSet<_I>&, unsigned int > smpl( dsI, xi );
+      double dotp = this->f( smpl, yj );
+      double sum = loss*(1.0 + dotp);
+
+      if( sum > maxval )
+	{
+	  maxval = sum;
+	  best_yj = yj;
+	}
+    }
+
+  return best_yj;
+}
+
+
+#endif
+
